@@ -30,6 +30,13 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
   | `pi_sulfur` | ring–atom | Reddish-purple (dotted) | 5.3 Å · Ringer/Zauhar *(UNCERTAIN)* |
   | `pi_anion` | ring–centre | Yellow (dotted) | 5.0 Å, offset 2.0 *(UNCERTAIN)* |
 
+- **Two selectable detection engines** — a switch, not a merge: `plip`
+  (default, Salentin et al. defaults) or `ds` (Discovery Studio
+  Visualizer-style thresholds — generally looser distance cutoffs and a lower
+  H-bond angle floor). Same detectors run under both; only the numeric
+  cutoffs change. Toggle with a radio button in the GUI, or
+  `interactions_set_engine ds` / `detect_interactions ..., engine=ds` on the
+  command line.
 - **Colour-blind-safe** Okabe-Ito palette. `pipi` uses one colour with two dash
   styles: **sandwich = long dash**, **T-shaped = short dash**. The 4 extended
   types (>8) reuse a hue but are drawn **dotted** to stay distinct.
@@ -99,6 +106,11 @@ detect_interactions polymer, organic, show_residues=1
 # auto-detect the ligand instead of naming sel2
 detect_interactions polymer, auto
 
+# switch detection engine: 'plip' (default) or 'ds' (Discovery Studio-style)
+interactions_set_engine ds
+detect_interactions polymer, organic                 # now uses DS cutoffs
+detect_interactions polymer, organic, engine=plip     # switch back inline
+
 # MD trajectory: persistence (%) of each interaction over states 1..last
 interactions_occupancy polymer, organic
 interactions_occupancy polymer, organic, start=1, end=500, threshold=25
@@ -125,10 +137,12 @@ interactions_set_cutoff pipi_dist, 5.0
 interactions_set_cutoff reset
 ```
 
-The GUI dialog (`Plugin ▸ Non-Covalent Interactions`) exposes all of this: an
-**Appearance** panel (live dash thickness / scale / label size), **Show / Hide /
-Clear** buttons, a per-type **count summary** after Detect, and an **Edit
-cutoffs...** advanced editor.
+The GUI dialog (`Plugin ▸ Non-Covalent Interactions`) exposes all of this: a
+**Detection engine** radio-button toggle (PLIP-style / Discovery
+Studio-style, switches immediately), an **Appearance** panel (live dash
+thickness / scale / label size), **Show / Hide / Clear** buttons, a per-type
+**count summary** after Detect, and an **Edit cutoffs...** advanced editor
+(reflects whichever engine is currently active).
 
 ### Parameters
 
@@ -142,6 +156,7 @@ cutoffs...** advanced editor.
 | `group_name` | `interactions` | Side-panel group collecting every object. |
 | `label` | `0` | `1` → keep the numeric distance label on each dash. |
 | `show_residues` | `0` | `1` → show interacting residues as sticks in `<group_name>_residues`. |
+| `engine` | `''` (keep current) | `plip` or `ds` → switch detection engine before computing. |
 
 ### Quick test
 
@@ -156,9 +171,13 @@ show_interaction_legend
 
 ## Notes & limitations
 
-- **Cutoffs** live in the `CUTOFFS` dict at the top of `interactions_plugin.py`
-  and are editable. Each carries a source comment; values without a firm
-  literature consensus are flagged `UNCERTAIN` (`carbon_hbond`, `pialkyl`).
+- **Cutoffs** live in `CUTOFF_PROFILES` (`plip` and `ds`) at the top of
+  `interactions_plugin.py`; `CUTOFFS` is the active engine's table and is
+  editable at runtime. Each entry carries a source comment; values without a
+  firm literature consensus are flagged `UNCERTAIN`. The whole `ds` profile is
+  `UNCERTAIN` by nature — Discovery Studio Visualizer's exact thresholds are
+  proprietary, so these are literature/tutorial-derived approximations, not a
+  byte-for-byte reproduction of DS's algorithm.
 - **Hydrogens**: with explicit H present, H-bond/halogen **angle** checks apply.
   Without H, the plugin falls back to a heavy-atom distance-only mode and prints
   a note — add hydrogens for stricter results.

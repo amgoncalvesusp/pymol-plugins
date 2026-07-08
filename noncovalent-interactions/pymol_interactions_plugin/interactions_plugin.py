@@ -22,9 +22,13 @@ USAGE (PyMOL command line)
   detect_interactions polymer, organic, state=5          # one MD frame
   detect_interactions polymer, organic, disable_native_hbond=1
   detect_interactions polymer, organic, show_residues=1  # residues as sticks
+  detect_interactions polymer, organic, engine=ds         # DS-style cutoffs
 
 COMMANDS
   detect_interactions      detect + draw for one state (main command)
+  interactions_set_engine  switch detection engine: 'plip' (default) or 'ds'
+                           (Discovery Studio Visualizer-style cutoffs); also
+                           a radio-button toggle in interactions_gui
   interactions_occupancy   persistence (%) of each interaction over an MD
                            trajectory: loops states, prints/CSV a ranked table
   interactions_export_csv  dump one state's interactions to a CSV file
@@ -152,66 +156,117 @@ _PIPI_TSHAPED_DASH = (0.15, 0.45, 0.08)  # short dash
 
 
 # ===========================================================================
-# Geometric cutoffs  (edit here to override)
+# Geometric cutoffs  (edit here to override)  — two selectable engines
 # ===========================================================================
 #
 # Sources:
 #   PLIP    = Salentin et al. 2015, PLIP config.py defaults.
 #   Steiner = Steiner, Angew. Chem. Int. Ed. 2002 (weak H-bonds).
-#   DS      = Discovery Studio interaction definitions (proprietary; ranges
-#             approximate, flagged UNCERTAIN).
+#   DS      = BIOVIA Discovery Studio Visualizer "Non-bond Interaction
+#             Monitor" defaults (proprietary; values below are the ranges
+#             commonly reported in DS documentation/tutorials and published
+#             docking studies that cite them — approximate, flagged
+#             UNCERTAIN where no single agreed number exists). The DS engine
+#             is generally more permissive on distance and uses a looser
+#             donor-H...acceptor angle floor than PLIP.
 #
-CUTOFFS = {
-    # Conventional H-bond: donor(N/O)...acceptor(N/O) heavy-atom distance.
-    # PLIP HBOND_DIST_MAX = 4.1 A; D-H...A angle >= 100 deg (angle only if H present).
-    "hbond_dist": 4.1,
-    "hbond_angle": 100.0,
-    # Carbon H-bond (weak): C...acceptor distance, C-H...A angle.
-    # Steiner reports C...O up to ~3.5-4.0 A; angle typically >120 deg.
-    # UNCERTAIN: no single agreed cutoff. Defaults chosen conservatively.
-    "carbon_hbond_dist": 3.6,  # UNCERTAIN
-    "carbon_hbond_angle": 120.0,  # UNCERTAIN
-    # Salt bridge: distance between charged centres. PLIP SALTBRIDGE_DIST_MAX = 5.5.
-    "saltbridge_dist": 5.5,
-    # pi-pi stacking: centroid-centroid distance, planar offset, plane angle.
-    # PLIP: PISTACK_DIST_MAX = 5.5, PISTACK_OFFSET_MAX = 2.0, PISTACK_ANG_DEV = 30.
-    #   sandwich (parallel): inter-plane angle < 30 deg
-    #   T-shaped (perpendicular): inter-plane angle in [60, 90] deg
-    "pipi_dist": 5.5,
-    "pipi_offset": 2.0,
-    "pipi_angle_dev": 30.0,
-    # pi-cation: cation...ring-centroid distance, planar offset.
-    # PLIP PICATION_DIST_MAX = 6.0, offset <= 2.0.
-    "pication_dist": 6.0,
-    "pication_offset": 2.0,
-    # pi-alkyl: ring-centroid...aliphatic-carbon distance.
-    # DS-derived hydrophobic/pi contact ~4-6 A. UNCERTAIN.
-    "pialkyl_dist": 5.0,  # UNCERTAIN
-    # Alkyl-alkyl (hydrophobic C...C). PLIP HYDROPH_DIST_MAX = 4.0.
-    "alkyl_dist": 4.0,
-    # Halogen bond: X(Cl/Br/I)...acceptor(N/O/S) distance, C-X...A angle.
-    # PLIP HALOGEN_DIST_MAX = 4.0; C-X...A angle 165 +/- 30 => >= 135 deg.
-    "halogen_dist": 4.0,
-    "halogen_angle": 135.0,
-    # Metal coordination: metal ion...(O/N/S) distance. PLIP METAL_DIST_MAX = 3.0.
-    "metal_dist": 3.0,
-    # Water-mediated H-bond (bridge): each leg water-O...(donor/acceptor) heavy
-    # distance, plus angle at the water O. PLIP WATER_BRIDGE_MINDIST = 2.5,
-    # MAXDIST = 4.1, omega angle 75-140 deg.
-    "water_bridge_min": 2.5,
-    "water_bridge_max": 4.1,
-    "water_bridge_angle_min": 75.0,
-    "water_bridge_angle_max": 140.0,
-    # pi-sulfur: aromatic-ring centroid...S distance.
-    # Ringer et al. / Zauhar et al. report optimal ~5.3 A. UNCERTAIN (range 5.0-6.0).
-    "pi_sulfur_dist": 5.3,  # UNCERTAIN
-    # pi-anion: aromatic-ring centroid...anion distance + planar offset.
-    # Less standardised; ~5.0 A above the ring plane. UNCERTAIN (range 4.5-5.0).
-    "pi_anion_dist": 5.0,  # UNCERTAIN
-    "pi_anion_offset": 2.0,
+# Same detection code (detect_hbond, detect_pipi, ...) runs under both
+# profiles; only the numeric thresholds in CUTOFFS change. water_bridge,
+# pi_sulfur and pi_anion are not formally defined by DS, so the "ds" profile
+# reuses the PLIP/literature values for those three.
+CUTOFF_PROFILES = {
+    "plip": {
+        # Conventional H-bond: donor(N/O)...acceptor(N/O) heavy-atom distance.
+        # PLIP HBOND_DIST_MAX = 4.1 A; D-H...A angle >= 100 deg (angle only if H present).
+        "hbond_dist": 4.1,
+        "hbond_angle": 100.0,
+        # Carbon H-bond (weak): C...acceptor distance, C-H...A angle.
+        # Steiner reports C...O up to ~3.5-4.0 A; angle typically >120 deg.
+        # UNCERTAIN: no single agreed cutoff. Defaults chosen conservatively.
+        "carbon_hbond_dist": 3.6,  # UNCERTAIN
+        "carbon_hbond_angle": 120.0,  # UNCERTAIN
+        # Salt bridge: distance between charged centres. PLIP SALTBRIDGE_DIST_MAX = 5.5.
+        "saltbridge_dist": 5.5,
+        # pi-pi stacking: centroid-centroid distance, planar offset, plane angle.
+        # PLIP: PISTACK_DIST_MAX = 5.5, PISTACK_OFFSET_MAX = 2.0, PISTACK_ANG_DEV = 30.
+        #   sandwich (parallel): inter-plane angle < 30 deg
+        #   T-shaped (perpendicular): inter-plane angle in [60, 90] deg
+        "pipi_dist": 5.5,
+        "pipi_offset": 2.0,
+        "pipi_angle_dev": 30.0,
+        # pi-cation: cation...ring-centroid distance, planar offset.
+        # PLIP PICATION_DIST_MAX = 6.0, offset <= 2.0.
+        "pication_dist": 6.0,
+        "pication_offset": 2.0,
+        # pi-alkyl: ring-centroid...aliphatic-carbon distance.
+        # DS-derived hydrophobic/pi contact ~4-6 A. UNCERTAIN.
+        "pialkyl_dist": 5.0,  # UNCERTAIN
+        # Alkyl-alkyl (hydrophobic C...C). PLIP HYDROPH_DIST_MAX = 4.0.
+        "alkyl_dist": 4.0,
+        # Halogen bond: X(Cl/Br/I)...acceptor(N/O/S) distance, C-X...A angle.
+        # PLIP HALOGEN_DIST_MAX = 4.0; C-X...A angle 165 +/- 30 => >= 135 deg.
+        "halogen_dist": 4.0,
+        "halogen_angle": 135.0,
+        # Metal coordination: metal ion...(O/N/S) distance. PLIP METAL_DIST_MAX = 3.0.
+        "metal_dist": 3.0,
+        # Water-mediated H-bond (bridge): each leg water-O...(donor/acceptor) heavy
+        # distance, plus angle at the water O. PLIP WATER_BRIDGE_MINDIST = 2.5,
+        # MAXDIST = 4.1, omega angle 75-140 deg.
+        "water_bridge_min": 2.5,
+        "water_bridge_max": 4.1,
+        "water_bridge_angle_min": 75.0,
+        "water_bridge_angle_max": 140.0,
+        # pi-sulfur: aromatic-ring centroid...S distance.
+        # Ringer et al. / Zauhar et al. report optimal ~5.3 A. UNCERTAIN (range 5.0-6.0).
+        "pi_sulfur_dist": 5.3,  # UNCERTAIN
+        # pi-anion: aromatic-ring centroid...anion distance + planar offset.
+        # Less standardised; ~5.0 A above the ring plane. UNCERTAIN (range 4.5-5.0).
+        "pi_anion_dist": 5.0,  # UNCERTAIN
+        "pi_anion_offset": 2.0,
+    },
+    "ds": {
+        # DS conventional H-bond: D...A <= 3.5 A, angle floor ~90 deg (looser
+        # than PLIP's 100 deg). UNCERTAIN (proprietary, literature-derived).
+        "hbond_dist": 3.5,  # UNCERTAIN
+        "hbond_angle": 90.0,  # UNCERTAIN
+        "carbon_hbond_dist": 3.8,  # UNCERTAIN
+        "carbon_hbond_angle": 90.0,  # UNCERTAIN
+        # DS "Attractive Charge" electrostatic interaction: tighter than PLIP.
+        "saltbridge_dist": 5.0,  # UNCERTAIN
+        # DS Pi-Pi Stacked/T-shaped: looser distance + offset than PLIP.
+        "pipi_dist": 6.0,  # UNCERTAIN
+        "pipi_offset": 2.5,  # UNCERTAIN
+        "pipi_angle_dev": 30.0,
+        "pication_dist": 6.0,  # UNCERTAIN
+        "pication_offset": 2.5,  # UNCERTAIN
+        # DS groups pi-alkyl and alkyl-alkyl under one looser hydrophobic cutoff.
+        "pialkyl_dist": 5.0,  # UNCERTAIN
+        "alkyl_dist": 5.0,  # UNCERTAIN
+        # DS halogen bond: near-linear geometry, angle floor ~140 deg.
+        "halogen_dist": 4.0,  # UNCERTAIN
+        "halogen_angle": 140.0,  # UNCERTAIN
+        # DS metal coordination: tighter than PLIP's 3.0.
+        "metal_dist": 2.9,  # UNCERTAIN
+        # Not formally defined by DS -- reuse PLIP/literature values.
+        "water_bridge_min": 2.5,
+        "water_bridge_max": 4.1,
+        "water_bridge_angle_min": 75.0,
+        "water_bridge_angle_max": 140.0,
+        "pi_sulfur_dist": 5.3,  # UNCERTAIN
+        "pi_anion_dist": 5.0,  # UNCERTAIN
+        "pi_anion_offset": 2.0,
+    },
 }
+DETECTION_ENGINES = list(CUTOFF_PROFILES.keys())  # ["plip", "ds"]
 
-# Pristine copy of the shipped defaults (for the GUI "Reset" in the cutoff editor).
+# Active cutoff table (mutated in place by interactions_set_engine /
+# interactions_set_cutoff so every detector, which reads the CUTOFFS global
+# directly, immediately sees the change).
+CUTOFFS = dict(CUTOFF_PROFILES["plip"])
+_active_engine = ["plip"]
+
+# Pristine copy of the *active engine's* defaults (for the GUI "Reset" in the
+# cutoff editor). Refreshed by interactions_set_engine on every switch.
 _CUTOFF_DEFAULTS = dict(CUTOFFS)
 
 VALID_TYPES = list(INTERACTION_COLORS.keys())
@@ -1057,6 +1112,7 @@ def detect_interactions(
     group_name="interactions",
     label=0,
     show_residues=0,
+    engine="",
 ):
     """Detect and draw non-covalent interactions between sel1 and sel2.
 
@@ -1067,7 +1123,11 @@ def detect_interactions(
     sel2='auto' picks the ligand automatically (organic, else non-polymer).
     show_residues 1 => also display interacting residues as sticks in a
         selection named '<group_name>_residues'.
+    engine  '' (default) => keep the currently active engine; 'plip' or
+        'ds' => switch engine first (see interactions_set_engine).
     """
+    if engine:
+        interactions_set_engine(engine)
     _register_colors()
     sel1 = _resolve_selection(sel1)
     sel2 = _resolve_selection(sel2)
@@ -1341,6 +1401,29 @@ def interactions_visibility(action="show", group_name="interactions"):
     print("[interactions] visibility '%s' applied." % action)
 
 
+def interactions_set_engine(engine="plip"):
+    """Switch the active detection engine: 'plip' (default) or 'ds'.
+
+    Reloads CUTOFFS in place from CUTOFF_PROFILES[engine] and resets the
+    per-engine defaults used by interactions_set_cutoff('reset', ...). Any
+    cutoff values manually edited via interactions_set_cutoff or the "Edit
+    cutoffs..." dialog under the previous engine are discarded on switch.
+    """
+    engine = str(engine).strip().lower()
+    if engine not in CUTOFF_PROFILES:
+        print(
+            "[interactions] unknown engine '%s'. Valid: %s"
+            % (engine, ", ".join(DETECTION_ENGINES))
+        )
+        return
+    global _CUTOFF_DEFAULTS
+    _active_engine[0] = engine
+    CUTOFFS.clear()
+    CUTOFFS.update(CUTOFF_PROFILES[engine])
+    _CUTOFF_DEFAULTS = dict(CUTOFFS)
+    print("[interactions] detection engine set to '%s'." % engine)
+
+
 def interactions_set_cutoff(key, value):
     """Set a single geometric cutoff at runtime (see the CUTOFFS table).
 
@@ -1425,6 +1508,20 @@ def run_plugin_gui():
         _dialog = QtWidgets.QDialog()
         _dialog.setWindowTitle("Non-Covalent Interactions")
         form = QtWidgets.QFormLayout(_dialog)
+
+        # Detection engine toggle (switch, like DockLens' engine switch).
+        engine_box = QtWidgets.QGroupBox("Detection engine")
+        ebox = QtWidgets.QHBoxLayout(engine_box)
+        rb_plip = QtWidgets.QRadioButton("PLIP-style (default)")
+        rb_ds = QtWidgets.QRadioButton("Discovery Studio-style")
+        rb_plip.setChecked(_active_engine[0] != "ds")
+        rb_ds.setChecked(_active_engine[0] == "ds")
+        ebox.addWidget(rb_plip)
+        ebox.addWidget(rb_ds)
+        form.addRow(engine_box)
+        rb_ds.toggled.connect(
+            lambda checked: interactions_set_engine("ds" if checked else "plip")
+        )
 
         sel1 = QtWidgets.QLineEdit("polymer")
         sel2 = QtWidgets.QLineEdit("organic")
@@ -1674,6 +1771,13 @@ def _open_cutoff_editor():
         b_reset.clicked.connect(_reset)
         b_done.clicked.connect(_cutoff_dialog.hide)
         _cutoff_dialog.resize(320, 480)
+        _cutoff_dialog._spins = spins  # keep for refresh on re-show (engine switch)
+
+    # Refresh displayed values from the active engine every time the dialog
+    # is (re)opened, so an "Edit cutoffs..." click after switching engines
+    # (or after a CLI interactions_set_cutoff call) shows current numbers.
+    for key, sp in _cutoff_dialog._spins.items():
+        sp.setValue(float(CUTOFFS[key]))
 
     _cutoff_dialog.show()
     _cutoff_dialog.raise_()
@@ -1690,6 +1794,7 @@ cmd.extend("interactions_figure_preset", interactions_figure_preset)
 cmd.extend("interactions_set_appearance", interactions_set_appearance)
 cmd.extend("interactions_visibility", interactions_visibility)
 cmd.extend("interactions_set_cutoff", interactions_set_cutoff)
+cmd.extend("interactions_set_engine", interactions_set_engine)
 cmd.extend("show_interaction_legend", show_interaction_legend)
 cmd.extend("interactions_gui", run_plugin_gui)
 
