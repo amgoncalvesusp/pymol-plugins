@@ -5,11 +5,13 @@ geometry and feature code be tested in a regular Python environment.
 """
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 def _load_plugin():
@@ -28,6 +30,140 @@ def _load_plugin():
 
 
 plugin = _load_plugin()
+
+
+class _FakeDialog:
+    def __init__(self):
+        self.minimum_size = None
+        self.size = None
+        self.size_grip_enabled = False
+        self.layout = None
+
+    def setMinimumSize(self, width, height):
+        self.minimum_size = (width, height)
+
+    def resize(self, width, height):
+        self.size = (width, height)
+
+    def setSizeGripEnabled(self, enabled):
+        self.size_grip_enabled = enabled
+
+
+class _FakeLayout:
+    AllNonFixedFieldsGrow = "grow"
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.widgets = []
+        self.margins = None
+        self.field_growth_policy = None
+        parent.layout = self
+
+    def setContentsMargins(self, *margins):
+        self.margins = margins
+
+    def addWidget(self, widget):
+        self.widgets.append(widget)
+
+    def setFieldGrowthPolicy(self, policy):
+        self.field_growth_policy = policy
+
+
+class _FakeScrollArea:
+    def __init__(self, parent):
+        self.parent = parent
+        self.resizable = False
+        self.horizontal_policy = None
+        self.vertical_policy = None
+        self.widget = None
+
+    def setWidgetResizable(self, value):
+        self.resizable = value
+
+    def setHorizontalScrollBarPolicy(self, policy):
+        self.horizontal_policy = policy
+
+    def setVerticalScrollBarPolicy(self, policy):
+        self.vertical_policy = policy
+
+    def setWidget(self, widget):
+        self.widget = widget
+
+
+class _FakeWidget:
+    def __init__(self, parent):
+        self.parent = parent
+        self.layout = None
+
+
+class _FakeQtWidgets:
+    QVBoxLayout = _FakeLayout
+    QFormLayout = _FakeLayout
+    QScrollArea = _FakeScrollArea
+    QWidget = _FakeWidget
+
+
+class _FakeQtCore:
+    class Qt:
+        ScrollBarAsNeeded = "as-needed"
+
+
+class _FakeScreen:
+    def availableGeometry(self):
+        return types.SimpleNamespace(width=lambda: 360, height=lambda: 384)
+
+
+class _FakeApplication:
+    @staticmethod
+    def instance():
+        return types.SimpleNamespace(primaryScreen=lambda: _FakeScreen())
+
+
+class _FakeQtWidgetsWithScreen(_FakeQtWidgets):
+    QApplication = _FakeApplication
+
+
+def test_gui_layout_is_scrollable_and_resizable_for_small_screens():
+    dialog = _FakeDialog()
+    form = plugin._build_scrollable_form(_FakeQtWidgets, _FakeQtCore, dialog)
+
+    scroll = dialog.layout.widgets[0]
+    assert dialog.minimum_size == (320, 240)
+    assert dialog.size == (580, 720)
+    assert dialog.size_grip_enabled is True
+    assert scroll.resizable is True
+    assert scroll.horizontal_policy == "as-needed"
+    assert scroll.vertical_policy == "as-needed"
+    assert scroll.widget.layout is form
+
+
+def test_gui_size_is_capped_by_available_high_dpi_screen():
+    minimum, initial = plugin._dialog_sizes_for_screen(_FakeQtWidgetsWithScreen)
+
+    assert minimum == (320, 240)
+    assert initial == (328, 352)
+
+
+def test_gui_entrypoint_creates_a_real_scroll_area(monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtCore = pytest.importorskip("PyQt5.QtCore")
+    QtWidgets = pytest.importorskip("PyQt5.QtWidgets")
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pymol_qt = types.ModuleType("pymol.Qt")
+    pymol_qt.QtCore = QtCore
+    pymol_qt.QtWidgets = QtWidgets
+    monkeypatch.setitem(sys.modules, "pymol.Qt", pymol_qt)
+
+    plugin._dialog = None
+    plugin.run_plugin_gui()
+    scroll = plugin._dialog.findChild(QtWidgets.QScrollArea)
+
+    assert app is not None
+    assert scroll is not None
+    assert scroll.widgetResizable() is True
+    plugin._dialog.close()
+    plugin._dialog.deleteLater()
+    plugin._dialog = None
 
 
 def _atom(idx, elem, coord, name):

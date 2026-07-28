@@ -48,6 +48,8 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
   persistence (% of frames) across a trajectory, ranked, with optional CSV.
 - **CSV export**: `interactions_export_csv` dumps one state to CSV, including
   hydrogen, H-to-centroid distance and face-angle fields where applicable.
+- **Responsive dialog**: controls stay available on compact or high-DPI screens
+  through a resizable, screen-aware window with automatic scroll bars.
 - **Publication preset**: `interactions_figure_preset` sets white bg, ray, PNG.
 - **Auto-ligand**: pass `sel2=auto` to detect the ligand automatically.
 - **3D on-screen legend**: `show_interaction_legend onscreen=1`.

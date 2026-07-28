@@ -1689,16 +1689,75 @@ def show_interaction_legend(onscreen=0, sele="all"):
 
 _dialog = None  # module-level ref keeps the dialog from being GC'd
 
+_GUI_MIN_SIZE = (320, 240)
+_GUI_DEFAULT_SIZE = (580, 720)
+
+
+def _dialog_sizes_for_screen(QtWidgets):
+    """Return usable minimum and initial sizes for the active Qt screen.
+
+    PyMOL can run with substantial high-DPI scaling, where a physically large
+    display has a small logical height.  Cap both values to the available Qt
+    work area so the scrollable dialog never starts beyond the visible screen.
+    """
+    app_class = getattr(QtWidgets, "QApplication", None)
+    app = app_class.instance() if app_class is not None else None
+    screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return _GUI_MIN_SIZE, _GUI_DEFAULT_SIZE
+    try:
+        geometry = screen.availableGeometry()
+        usable_width = max(1, int(geometry.width()) - 32)
+        usable_height = max(1, int(geometry.height()) - 32)
+    except Exception:
+        return _GUI_MIN_SIZE, _GUI_DEFAULT_SIZE
+    minimum = (
+        min(_GUI_MIN_SIZE[0], usable_width),
+        min(_GUI_MIN_SIZE[1], usable_height),
+    )
+    initial = (
+        min(_GUI_DEFAULT_SIZE[0], usable_width),
+        min(_GUI_DEFAULT_SIZE[1], usable_height),
+    )
+    return minimum, initial
+
+
+def _build_scrollable_form(QtWidgets, QtCore, dialog):
+    """Create the responsive, scrollable content area for the plug-in dialog.
+
+    Keeping the complete form inside a ``QScrollArea`` means every control is
+    reachable on compact laptop displays and under high-DPI scaling, while
+    larger screens retain a comfortably sized resizable window.
+    """
+    minimum, initial = _dialog_sizes_for_screen(QtWidgets)
+    dialog.setMinimumSize(*minimum)
+    dialog.resize(*initial)
+    dialog.setSizeGripEnabled(True)
+
+    outer = QtWidgets.QVBoxLayout(dialog)
+    outer.setContentsMargins(0, 0, 0, 0)
+    scroll = QtWidgets.QScrollArea(dialog)
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+
+    content = QtWidgets.QWidget(scroll)
+    form = QtWidgets.QFormLayout(content)
+    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+    scroll.setWidget(content)
+    outer.addWidget(scroll)
+    return form
+
 
 def run_plugin_gui():
     """Open the interaction-detector dialog (Plugin menu callback)."""
     global _dialog
-    from pymol.Qt import QtWidgets  # imported lazily; absent in headless PyMOL
+    from pymol.Qt import QtCore, QtWidgets  # absent in headless PyMOL
 
     if _dialog is None:
         _dialog = QtWidgets.QDialog()
         _dialog.setWindowTitle("Non-Covalent Interactions")
-        form = QtWidgets.QFormLayout(_dialog)
+        form = _build_scrollable_form(QtWidgets, QtCore, _dialog)
 
         # Detection engine toggle (switch, like DockLens' engine switch).
         engine_box = QtWidgets.QGroupBox("Detection engine")
