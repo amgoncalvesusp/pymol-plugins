@@ -42,9 +42,9 @@ COMMANDS
   sel1  receptor side  (default 'polymer')
   sel2  ligand side    (default 'organic'; 'auto' -> organic else non-polymer)
         -- keep sel1/sel2 as DISTINCT groups
-  types space/comma list, or 'all'. Valid (12):
+  types space/comma list, or 'all'. Valid (15):
         hbond carbon_hbond saltbridge pipi pication pialkyl alkyl halogen
-        metal water_bridge pi_sulfur pi_anion
+        metal water_bridge pi_sulfur pi_anion pi_sigma pi_donor_hbond pi_lone_pair
   state  model state used for coordinates (1 = first; for a trajectory pass the
          frame number and re-run to recompute per frame).
   disable_native_hbond  1 => hide PyMOL's own polar-contact dashes to avoid
@@ -116,10 +116,16 @@ INTERACTION_COLORS = {
     "water_bridge": ("skyblue", "Water-mediated H-bond (dotted)"),
     "pi_sulfur": ("reddishpurple", "pi-sulfur (dotted)"),
     "pi_anion": ("yellow", "pi-anion (dotted)"),
+    "pi_sigma": ("reddishpurple", "Pi-sigma C-H/pi (dotted)"),
+    "pi_donor_hbond": ("bluishgreen", "Pi-donor hydrogen bond (dotted)"),
+    "pi_lone_pair": ("yellow", "Pi-lone-pair (dotted)"),
 }
 
 # Extended types are rendered dotted to disambiguate the reused hue.
-_EXTENDED_TYPES = {"metal", "water_bridge", "pi_sulfur", "pi_anion"}
+_EXTENDED_TYPES = {
+    "metal", "water_bridge", "pi_sulfur", "pi_anion", "pi_sigma",
+    "pi_donor_hbond", "pi_lone_pair",
+}
 
 
 def _color_name(itype):
@@ -150,6 +156,9 @@ _DASH_STYLE = {
     "water_bridge": (0.08, 0.32, 0.05),
     "pi_sulfur": (0.10, 0.32, 0.07),
     "pi_anion": (0.08, 0.32, 0.07),
+    "pi_sigma": (0.10, 0.32, 0.07),
+    "pi_donor_hbond": (0.10, 0.32, 0.07),
+    "pi_lone_pair": (0.08, 0.32, 0.07),
 }
 _PIPI_SANDWICH_DASH = (0.60, 0.20, 0.08)  # long dash
 _PIPI_TSHAPED_DASH = (0.15, 0.45, 0.08)  # short dash
@@ -223,6 +232,18 @@ CUTOFF_PROFILES = {
         # Less standardised; ~5.0 A above the ring plane. UNCERTAIN (range 4.5-5.0).
         "pi_anion_dist": 5.0,  # UNCERTAIN
         "pi_anion_offset": 2.0,
+        # The three face-to-ring types are enabled only by the DS-calibrated
+        # engine; values are retained here so the table stays editable.
+        "pi_sigma_carbon_dist": 4.5,
+        "pi_sigma_h_centroid_dist": 4.3,
+        "pi_sigma_axis_angle": 40.0,
+        "pi_sigma_dha_angle": 160.0,
+        "pi_donor_dist": 5.2,
+        "pi_donor_h_centroid_dist": 4.1,
+        "pi_donor_axis_angle": 45.0,
+        "pi_donor_dha_angle": 145.0,
+        "pi_lone_pair_dist": 3.5,
+        "pi_lone_pair_angle": 30.0,
     },
     "ds": {
         # DS conventional H-bond: D...A <= 3.5 A, angle floor ~90 deg (looser
@@ -239,14 +260,15 @@ CUTOFF_PROFILES = {
         "pipi_angle_dev": 30.0,
         "pication_dist": 6.0,  # UNCERTAIN
         "pication_offset": 2.5,  # UNCERTAIN
-        # DS groups pi-alkyl and alkyl-alkyl under one looser hydrophobic cutoff.
-        "pialkyl_dist": 5.0,  # UNCERTAIN
-        "alkyl_dist": 5.0,  # UNCERTAIN
+        # Empirically calibrated on the 2m5d Discovery Studio annotations.
+        # Wider contacts occur visually, but inflating these global cutoffs
+        # created many false positives in the complete reference corpus.
+        "pialkyl_dist": 4.9,
+        "alkyl_dist": 4.2,
         # DS halogen bond: near-linear geometry, angle floor ~140 deg.
         "halogen_dist": 4.0,  # UNCERTAIN
         "halogen_angle": 140.0,  # UNCERTAIN
-        # DS metal coordination: tighter than PLIP's 3.0.
-        "metal_dist": 2.9,  # UNCERTAIN
+        "metal_dist": 3.0,
         # Not formally defined by DS -- reuse PLIP/literature values.
         "water_bridge_min": 2.5,
         "water_bridge_max": 4.1,
@@ -255,6 +277,18 @@ CUTOFF_PROFILES = {
         "pi_sulfur_dist": 5.3,  # UNCERTAIN
         "pi_anion_dist": 5.0,  # UNCERTAIN
         "pi_anion_offset": 2.0,
+        # Direct DSV observations: pi-sigma H-centroid distances up to 4.29 A
+        # and theta up to 37.57 deg; pi-donor contacts up to 4.10 A / 44.07 deg.
+        "pi_sigma_carbon_dist": 4.5,
+        "pi_sigma_h_centroid_dist": 4.3,
+        "pi_sigma_axis_angle": 40.0,
+        "pi_sigma_dha_angle": 160.0,
+        "pi_donor_dist": 5.2,
+        "pi_donor_h_centroid_dist": 4.1,
+        "pi_donor_axis_angle": 45.0,
+        "pi_donor_dha_angle": 145.0,
+        "pi_lone_pair_dist": 3.5,
+        "pi_lone_pair_angle": 30.0,
     },
 }
 DETECTION_ENGINES = list(CUTOFF_PROFILES.keys())  # ["plip", "ds"]
@@ -335,6 +369,16 @@ def _proj_offset(point, plane_point, normal):
     along = d.dot(_v(normal))
     perp = d - along * _v(normal)
     return float(np.linalg.norm(perp))
+
+
+def _axis_angle(point, centre, normal):
+    """Acute angle between a ring normal and its centroid-to-point vector."""
+    direction = _v(point) - _v(centre)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-6:
+        return 90.0
+    cosine = abs(np.clip((direction / norm).dot(_v(normal)), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
 
 
 # ===========================================================================
@@ -501,6 +545,7 @@ def classify(atoms, rings, has_h):
 
     donors = []  # (atom, [H atoms])  N/O-H donors
     carbon_donors = []  # (atom, [H atoms])  C-H donors
+    sigma_donors = []  # (atom, [H atoms]) explicit C-H donors for pi-sigma
     acceptors = []  # atoms
     cations = []  # (point, label)
     anions = []  # (point, label)
@@ -551,6 +596,11 @@ def classify(atoms, rings, has_h):
                 hs = _h_neighbors(a)
                 if hs:
                     carbon_donors.append((a, hs))
+                    # A topology-only plug-in cannot assign SYBYL C.3 types.
+                    # Excluding planar ring atoms is the conservative proxy used
+                    # here; the subsequent face/angle geometry is stringent.
+                    if a.idx not in ring_atom_ids:
+                        sigma_donors.append((a, hs))
             # aliphatic carbon: not aromatic-ring member, bonded only to C/H
             if a.idx not in ring_atom_ids:
                 heavy = [n for n in a.neighbors if n.elem != "H"]
@@ -568,6 +618,7 @@ def classify(atoms, rings, has_h):
     return {
         "donors": donors,
         "carbon_donors": carbon_donors,
+        "sigma_donors": sigma_donors,
         "acceptors": acceptors,
         "cations": cations,
         "anions": anions,
@@ -593,8 +644,6 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
     out = []
     for donor, hs in feat_a[donor_key]:
         for acc in feat_b["acceptors"]:
-            if donor.idx == acc.idx:
-                continue
             d = _dist(donor.coord, acc.coord)
             if d > dist_cut:
                 continue
@@ -721,23 +770,122 @@ def detect_pication(fa, fb):
 def detect_pialkyl(fa, fb):
     cut = CUTOFFS["pialkyl_dist"]
     out = []
+    best_by_group = {}
+    dsv_engine = _active_engine[0] == "ds"
     for rings, alks in ((fa["rings"], fb["alkyl"]), (fb["rings"], fa["alkyl"])):
         for r in rings:
             for a in alks:
-                if _dist(r.centroid, a.coord) <= cut:
-                    out.append(
-                        {
-                            "type": "pialkyl",
-                            "subtype": "",
-                            "a_label": r.tag,
-                            "b_label": a.label(),
-                            "a_point": r.centroid,
-                            "b_point": a.coord,
-                            "a_sele": r.atoms[0].res_sele(),
-                            "b_sele": a.res_sele(),
-                        }
-                    )
+                distance = _dist(r.centroid, a.coord)
+                if distance > cut:
+                    continue
+                if dsv_engine and any(
+                    _pi_sigma_geometry(r, a, h) is not None for h in _h_neighbors(a)
+                ):
+                    continue
+                record = {
+                    "type": "pialkyl",
+                    "subtype": "",
+                    "a_label": r.tag,
+                    "b_label": a.label(),
+                    "a_point": r.centroid,
+                    "b_point": a.coord,
+                    "a_sele": r.atoms[0].res_sele(),
+                    "b_sele": a.res_sele(),
+                }
+                if not dsv_engine:
+                    out.append(record)
+                    continue
+                key = (r.tag, a.res_tag())
+                previous = best_by_group.get(key)
+                if previous is None or distance < previous[0]:
+                    best_by_group[key] = (distance, record)
+    if dsv_engine:
+        out.extend(value[1] for value in best_by_group.values())
     return out
+
+
+def _pi_sigma_geometry(ring, donor, hydrogen):
+    """Return calibrated C-H/pi geometry or None when it fails."""
+    donor_distance = _dist(ring.centroid, donor.coord)
+    hydrogen_distance = _dist(ring.centroid, hydrogen.coord)
+    theta = _axis_angle(hydrogen.coord, ring.centroid, ring.normal)
+    donor_angle = _angle_at(hydrogen.coord, donor.coord, ring.centroid)
+    c = CUTOFFS
+    if (
+        donor_distance > c["pi_sigma_carbon_dist"]
+        or hydrogen_distance > c["pi_sigma_h_centroid_dist"]
+        or theta > c["pi_sigma_axis_angle"]
+        or donor_angle < c["pi_sigma_dha_angle"]
+    ):
+        return None
+    return donor_distance, hydrogen_distance, theta, donor_angle
+
+
+def detect_pi_sigma(fa, fb):
+    """Detect an axial explicit C-H sigma bond pointing at an aromatic face."""
+    if _active_engine[0] != "ds":
+        return []
+    best_by_pair = {}
+    for rings, donors in ((fa["rings"], fb["sigma_donors"]),
+                          (fb["rings"], fa["sigma_donors"])):
+        for ring in rings:
+            for donor, hydrogens in donors:
+                for hydrogen in hydrogens:
+                    geometry = _pi_sigma_geometry(ring, donor, hydrogen)
+                    if geometry is None:
+                        continue
+                    donor_distance, h_distance, theta, dha = geometry
+                    record = {
+                        "type": "pi_sigma", "subtype": "C-H/pi",
+                        "a_label": ring.tag, "b_label": donor.label(),
+                        "a_point": ring.centroid, "b_point": donor.coord,
+                        "a_sele": ring.atoms[0].res_sele(),
+                        "b_sele": donor.res_sele(), "hydrogen": hydrogen.label(),
+                        "hydrogen_centroid_distance_A": h_distance,
+                        "donor_hydrogen_centroid_angle_deg": dha,
+                        "theta_deg": theta,
+                        "donor_centroid_distance_A": donor_distance,
+                    }
+                    key = (ring.tag, donor.idx)
+                    if key not in best_by_pair or h_distance < best_by_pair[key][0]:
+                        best_by_pair[key] = (h_distance, record)
+    return [value[1] for value in best_by_pair.values()]
+
+
+def detect_pi_donor_hbond(fa, fb):
+    """Detect an explicit N/O-H donor directed towards an aromatic face."""
+    if _active_engine[0] != "ds":
+        return []
+    c = CUTOFFS
+    best_by_pair = {}
+    for rings, donors in ((fa["rings"], fb["donors"]), (fb["rings"], fa["donors"])):
+        for ring in rings:
+            for donor, hydrogens in donors:
+                for hydrogen in hydrogens:
+                    donor_distance = _dist(ring.centroid, donor.coord)
+                    h_distance = _dist(ring.centroid, hydrogen.coord)
+                    theta = _axis_angle(hydrogen.coord, ring.centroid, ring.normal)
+                    dha = _angle_at(hydrogen.coord, donor.coord, ring.centroid)
+                    if (donor_distance > c["pi_donor_dist"] or
+                            h_distance > c["pi_donor_h_centroid_dist"] or
+                            theta > c["pi_donor_axis_angle"] or
+                            dha < c["pi_donor_dha_angle"]):
+                        continue
+                    record = {
+                        "type": "pi_donor_hbond", "subtype": "X-H/pi",
+                        "a_label": ring.tag, "b_label": donor.label(),
+                        "a_point": ring.centroid, "b_point": donor.coord,
+                        "a_sele": ring.atoms[0].res_sele(),
+                        "b_sele": donor.res_sele(), "hydrogen": hydrogen.label(),
+                        "hydrogen_centroid_distance_A": h_distance,
+                        "donor_hydrogen_centroid_angle_deg": dha,
+                        "theta_deg": theta,
+                        "donor_centroid_distance_A": donor_distance,
+                    }
+                    key = (ring.tag, donor.idx)
+                    if key not in best_by_pair or h_distance < best_by_pair[key][0]:
+                        best_by_pair[key] = (h_distance, record)
+    return [value[1] for value in best_by_pair.values()]
 
 
 def detect_alkyl(fa, fb):
@@ -862,6 +1010,32 @@ def detect_pi_anion(fa, fb):
     return out
 
 
+def detect_pi_lone_pair(fa, fb):
+    """Detect an acceptor lone-pair positioned above an aromatic face."""
+    if _active_engine[0] != "ds":
+        return []
+    c = CUTOFFS
+    out = []
+    for acceptors, rings in ((fa["acceptors"], fb["rings"]),
+                             (fb["acceptors"], fa["rings"])):
+        for acceptor in acceptors:
+            for ring in rings:
+                distance = _dist(acceptor.coord, ring.centroid)
+                theta = _axis_angle(acceptor.coord, ring.centroid, ring.normal)
+                if distance > c["pi_lone_pair_dist"] or theta > c["pi_lone_pair_angle"]:
+                    continue
+                out.append(
+                    {
+                        "type": "pi_lone_pair", "subtype": "lone-pair/pi",
+                        "a_label": acceptor.label(), "b_label": ring.tag,
+                        "a_point": acceptor.coord, "b_point": ring.centroid,
+                        "a_sele": acceptor.res_sele(),
+                        "b_sele": ring.atoms[0].res_sele(), "theta_deg": theta,
+                    }
+                )
+    return out
+
+
 def detect_water_bridge(fa, fb, waters):
     """Water-mediated H-bond: an atom in fa and an atom in fb both H-bond to the
     same bridging water. Emits two dashed legs (partner--water) per bridge.
@@ -924,6 +1098,9 @@ _DETECTORS = {
     "metal": lambda fa, fb, h: detect_metal(fa, fb),
     "pi_sulfur": lambda fa, fb, h: detect_pi_sulfur(fa, fb),
     "pi_anion": lambda fa, fb, h: detect_pi_anion(fa, fb),
+    "pi_sigma": lambda fa, fb, h: detect_pi_sigma(fa, fb),
+    "pi_donor_hbond": lambda fa, fb, h: detect_pi_donor_hbond(fa, fb),
+    "pi_lone_pair": lambda fa, fb, h: detect_pi_lone_pair(fa, fb),
     # water_bridge handled separately (needs the water list) in _compute.
 }
 
@@ -1297,7 +1474,9 @@ def interactions_export_csv(
 ):
     """Write all interactions for one state to a CSV file.
 
-    Columns: state, type, subtype, partner_a, partner_b, distance_A.
+    The geometric fields are populated for face-directed interactions when
+    explicit hydrogens are present; blank cells mean the metric is not used by
+    that interaction class.
     """
     sel1 = _resolve_selection(sel1)
     sel2 = _resolve_selection(sel2)
@@ -1315,16 +1494,28 @@ def interactions_export_csv(
             it["a_label"],
             it["b_label"],
             round(it["dist"], 2),
+            it.get("hydrogen", ""),
+            _round_metric(it.get("hydrogen_centroid_distance_A")),
+            _round_metric(it.get("donor_hydrogen_centroid_angle_deg")),
+            _round_metric(it.get("theta_deg")),
         ]
         for it in inters
     ]
     _write_csv(
         filename,
-        ["state", "type", "subtype", "partner_a", "partner_b", "distance_A"],
+        [
+            "state", "type", "subtype", "partner_a", "partner_b", "distance_A",
+            "hydrogen", "hydrogen_centroid_distance_A",
+            "donor_hydrogen_centroid_angle_deg", "theta_deg",
+        ],
         rows,
     )
     print("[interactions] %d interaction(s) written to %s" % (len(rows), filename))
     return rows
+
+
+def _round_metric(value):
+    return "" if value is None else round(value, 2)
 
 
 def interactions_figure_preset(ray=0, filename=""):
@@ -1472,7 +1663,7 @@ def show_interaction_legend(onscreen=0, sele="all"):
     try:
         (x0, y0, z0), (x1, y1, z1) = cmd.get_extent(sele)
     except Exception:
-        (x0, y0, z0), (x1, y1, z1) = (0, 0, 0), (10, 10, 10)
+        y0, x1, y1, z1 = 0, 10, 10, 10
     x = x1 + 2.0
     ytop = y1
     step = max(1.5, (y1 - y0) / (len(INTERACTION_COLORS) + 1))

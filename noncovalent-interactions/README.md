@@ -12,7 +12,7 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
 
 ## Features
 
-- **12 interaction types**, three geometric classes (atom–atom, atom–ring,
+- **15 interaction types**, three geometric classes (atom–atom, atom–ring,
   ring–ring):
 
   | Type | Class | Colour (Okabe-Ito) | Cutoff · source |
@@ -29,12 +29,16 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
   | `water_bridge` | atom–water–atom | Sky-blue (dotted) | 2.5–4.1 Å legs, 75–140° · PLIP |
   | `pi_sulfur` | ring–atom | Reddish-purple (dotted) | 5.3 Å · Ringer/Zauhar *(UNCERTAIN)* |
   | `pi_anion` | ring–centre | Yellow (dotted) | 5.0 Å, offset 2.0 *(UNCERTAIN)* |
+  | `pi_sigma` | ring–C-H | Reddish-purple (dotted) | DS-calibrated face geometry |
+  | `pi_donor_hbond` | ring–N/O-H | Bluish-green (dotted) | DS-calibrated face geometry |
+  | `pi_lone_pair` | atom–ring | Yellow (dotted) | 3.5 Å, face angle ≤30° *(UNCERTAIN)* |
 
 - **Two selectable detection engines** — a switch, not a merge: `plip`
   (default, Salentin et al. defaults) or `ds` (Discovery Studio
-  Visualizer-style thresholds — generally looser distance cutoffs and a lower
-  H-bond angle floor). Same detectors run under both; only the numeric
-  cutoffs change. Toggle with a radio button in the GUI, or
+  Visualizer-style thresholds, calibrated against a 150-pose 2m5d annotation
+  set). The DS engine additionally enables the three face-directed interaction
+  types above and applies residue-level pi-alkyl consolidation. Toggle with a
+  radio button in the GUI, or
   `interactions_set_engine ds` / `detect_interactions ..., engine=ds` on the
   command line.
 - **Colour-blind-safe** Okabe-Ito palette. `pipi` uses one colour with two dash
@@ -42,7 +46,8 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
   types (>8) reuse a hue but are drawn **dotted** to stay distinct.
 - **MD occupancy**: `interactions_occupancy` reports each interaction's
   persistence (% of frames) across a trajectory, ranked, with optional CSV.
-- **CSV export**: `interactions_export_csv` dumps one state to CSV.
+- **CSV export**: `interactions_export_csv` dumps one state to CSV, including
+  hydrogen, H-to-centroid distance and face-angle fields where applicable.
 - **Publication preset**: `interactions_figure_preset` sets white bg, ray, PNG.
 - **Auto-ligand**: pass `sel2=auto` to detect the ligand automatically.
 - **3D on-screen legend**: `show_interaction_legend onscreen=1`.
@@ -150,7 +155,7 @@ thickness / scale / label size), **Show / Hide / Clear** buttons, a per-type
 |-------|---------|---------|
 | `sel1` | `polymer` | Receptor side. Keep `sel1`/`sel2` as **distinct** groups. |
 | `sel2` | `organic` | Ligand side. |
-| `types` | `all` | Space/comma list, or `all`. Valid: `hbond carbon_hbond saltbridge pipi pication pialkyl alkyl halogen`. |
+| `types` | `all` | Space/comma list, or `all`. Valid: `hbond carbon_hbond saltbridge pipi pication pialkyl alkyl halogen metal water_bridge pi_sulfur pi_anion pi_sigma pi_donor_hbond pi_lone_pair`. |
 | `state` | `1` | Model state used for coordinates (MD frame number). |
 | `disable_native_hbond` | `0` | `1` → hide PyMOL's own polar-contact/H-bond dashes. |
 | `group_name` | `interactions` | Side-panel group collecting every object. |
@@ -176,8 +181,9 @@ show_interaction_legend
   editable at runtime. Each entry carries a source comment; values without a
   firm literature consensus are flagged `UNCERTAIN`. The whole `ds` profile is
   `UNCERTAIN` by nature — Discovery Studio Visualizer's exact thresholds are
-  proprietary, so these are literature/tutorial-derived approximations, not a
-  byte-for-byte reproduction of DS's algorithm.
+  proprietary. The DS engine has been empirically calibrated against a 2m5d
+  annotation corpus and selected tables, but remains a transparent
+  approximation rather than a byte-for-byte reproduction of DS's algorithm.
 - **Hydrogens**: with explicit H present, H-bond/halogen **angle** checks apply.
   Without H, the plugin falls back to a heavy-atom distance-only mode and prints
   a note — add hydrogens for stricter results.
