@@ -8,6 +8,8 @@ entry point.
 
 from . import interactions_plugin
 
+__version__ = "0.4.1"
+
 
 def __init_plugin__(app=None):
     interactions_plugin.__init_plugin__(app)

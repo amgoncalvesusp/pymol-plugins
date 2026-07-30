@@ -26,8 +26,8 @@ USAGE (PyMOL command line)
 
 COMMANDS
   detect_interactions      detect + draw for one state (main command)
-  interactions_set_engine  switch detection engine: 'plip' (default) or 'ds'
-                           (Discovery Studio Visualizer-style cutoffs); also
+  interactions_set_engine  switch detection engine: 'ds' (default) or 'plip'
+                           ('ds' is the DockLens parity contract); also
                            a radio-button toggle in interactions_gui
   interactions_occupancy   persistence (%) of each interaction over an MD
                            trajectory: loops states, prints/CSV a ranked table
@@ -71,17 +71,117 @@ COLOURS  (Okabe-Ito, colour-blind-safe; see show_interaction_legend)
   metal          Vermillion  |  water_bridge  Sky-blue
   pi_sulfur      Reddish-purple  |  pi_anion   Yellow
 
-Geometric cutoffs follow PLIP defaults where available (Salentin et al.,
-Nucleic Acids Res 2015; PLIP config.py). Values without a firm consensus are
-marked "UNCERTAIN" in the CUTOFFS table below and are exposed as editable
-module constants. Ring perception is topology-based (bond-graph cycles +
+The default mode uses the bundled, reviewed DockLens interaction core and
+applies the same ``dsv`` chemistry plus ``ds_like`` analysis filter before
+drawing, counting, occupancy or CSV export. PLIP remains a separate mode.
+Ring perception is topology-based (bond-graph cycles +
 planarity heuristic) — no RDKit dependency.
 """
 
 from __future__ import print_function
 
+import importlib.util
+import hashlib
+import inspect
+import math
+import os
+import re
+import types
+
 import numpy as np
 from pymol import cmd
+
+_EXPECTED_DOCKLENS_CORE_SHA256 = (
+    "dfdee432587c26f5cbd1025ecd110d160966b805083100aec2832970ae99af1b"
+)
+_EXPECTED_ANALYSIS_PROFILE_SHA256 = (
+    "8f33342682f5ae5568ae7acc728f04584695d26facba22ff271cb8bf80341823"
+)
+
+
+def _bundled_path(filename):
+    """Locate bundled modules even when PyMOL's ``run`` rewrites __file__."""
+    script_hint = inspect.currentframe().f_code.co_filename
+    candidates = []
+    if os.path.isabs(script_hint):
+        candidates.append(os.path.dirname(script_hint))
+    module_file = globals().get("__file__", "")
+    if module_file and os.path.isabs(module_file):
+        candidates.append(os.path.dirname(module_file))
+    for base in candidates:
+        path = os.path.join(base, "pymol_interactions_plugin", filename)
+        if os.path.isfile(path):
+            return path
+    raise ImportError(
+        "Could not locate bundled %s. Install pymol_interactions_plugin.zip "
+        "with PyMOL Plugin Manager." % filename
+    )
+
+
+def _verify_reviewed_source(path, expected_sha256):
+    with open(path, "rb") as source_file:
+        actual = hashlib.sha256(source_file.read()).hexdigest()
+    if actual != expected_sha256:
+        raise ImportError(
+            "Bundled DockLens module failed integrity verification: %s" % path
+        )
+    return path
+
+
+try:
+    from . import docklens_core as _docklens_core
+except (ImportError, ValueError):
+    _core_path = _verify_reviewed_source(
+        _bundled_path("docklens_core.py"),
+        _EXPECTED_DOCKLENS_CORE_SHA256,
+    )
+    _core_spec = importlib.util.spec_from_file_location(
+        "pymol_interactions_docklens_core",
+        _core_path,
+    )
+    if _core_spec is None or _core_spec.loader is None:
+        raise ImportError("Could not load the bundled DockLens interaction core")
+    _docklens_core = importlib.util.module_from_spec(_core_spec)
+    _core_spec.loader.exec_module(_docklens_core)
+
+try:
+    from . import docklens_analysis_profiles as _docklens_analysis_profiles
+except (ImportError, ValueError):
+    _profiles_path = _verify_reviewed_source(
+        _bundled_path("docklens_analysis_profiles.py"),
+        _EXPECTED_ANALYSIS_PROFILE_SHA256,
+    )
+    _profiles_spec = importlib.util.spec_from_file_location(
+        "pymol_interactions_docklens_analysis_profiles",
+        _profiles_path,
+    )
+    if _profiles_spec is None or _profiles_spec.loader is None:
+        raise ImportError(
+            "Could not load the bundled DockLens analysis-profile helpers"
+        )
+    _docklens_analysis_profiles = importlib.util.module_from_spec(_profiles_spec)
+    _profiles_spec.loader.exec_module(_docklens_analysis_profiles)
+
+
+DSV_PARITY_CONTRACT = "docklens-dsv-2026.07"
+PLUGIN_VERSION = "0.4.1"
+
+
+def _module_source_sha256(module):
+    source = inspect.getsource(module).replace("\r\n", "\n")
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _parity_sources_are_reviewed():
+    try:
+        return (
+            _module_source_sha256(_docklens_core)
+            == _EXPECTED_DOCKLENS_CORE_SHA256
+            and _module_source_sha256(_docklens_analysis_profiles)
+            == _EXPECTED_ANALYSIS_PROFILE_SHA256
+        )
+    except (OSError, TypeError):
+        return False
 
 
 # ===========================================================================
@@ -108,6 +208,7 @@ INTERACTION_COLORS = {
     "pipi": ("reddishpurple", "pi-pi stacking (sandwich/T-shaped)"),
     "pication": ("yellow", "pi-cation"),
     "pialkyl": ("orange", "pi-alkyl"),
+    "pi_sigma": ("reddishpurple", "Pi-sigma C-H/pi (dotted)"),
     "alkyl": ("blue", "Alkyl-alkyl (hydrophobic)"),
     "halogen": ("black", "Halogen bond"),
     # --- extended set (>8 types): colour is reused, drawn with a DOTTED dash so
@@ -116,10 +217,11 @@ INTERACTION_COLORS = {
     "water_bridge": ("skyblue", "Water-mediated H-bond (dotted)"),
     "pi_sulfur": ("reddishpurple", "pi-sulfur (dotted)"),
     "pi_anion": ("yellow", "pi-anion (dotted)"),
-    "pi_sigma": ("reddishpurple", "Pi-sigma C-H/pi (dotted)"),
     "pi_donor_hbond": ("bluishgreen", "Pi-donor hydrogen bond (dotted)"),
-    "pi_lone_pair": ("yellow", "Pi-lone-pair (dotted)"),
+    "pi_lone_pair": ("skyblue", "Pi-lone-pair (dotted)"),
 }
+# Use DockLens' canonical ordering, colours and labels verbatim.
+INTERACTION_COLORS = dict(_docklens_core.INTERACTION_COLORS)
 
 # Extended types are rendered dotted to disambiguate the reused hue.
 _EXTENDED_TYPES = {
@@ -183,121 +285,70 @@ _PIPI_TSHAPED_DASH = (0.15, 0.45, 0.08)  # short dash
 # profiles; only the numeric thresholds in CUTOFFS change. water_bridge,
 # pi_sulfur and pi_anion are not formally defined by DS, so the "ds" profile
 # reuses the PLIP/literature values for those three.
-CUTOFF_PROFILES = {
-    "plip": {
-        # Conventional H-bond: donor(N/O)...acceptor(N/O) heavy-atom distance.
-        # PLIP HBOND_DIST_MAX = 4.1 A; D-H...A angle >= 100 deg (angle only if H present).
-        "hbond_dist": 4.1,
-        "hbond_angle": 100.0,
-        # Carbon H-bond (weak): C...acceptor distance, C-H...A angle.
-        # Steiner reports C...O up to ~3.5-4.0 A; angle typically >120 deg.
-        # UNCERTAIN: no single agreed cutoff. Defaults chosen conservatively.
-        "carbon_hbond_dist": 3.6,  # UNCERTAIN
-        "carbon_hbond_angle": 120.0,  # UNCERTAIN
-        # Salt bridge: distance between charged centres. PLIP SALTBRIDGE_DIST_MAX = 5.5.
-        "saltbridge_dist": 5.5,
-        # pi-pi stacking: centroid-centroid distance, planar offset, plane angle.
-        # PLIP: PISTACK_DIST_MAX = 5.5, PISTACK_OFFSET_MAX = 2.0, PISTACK_ANG_DEV = 30.
-        #   sandwich (parallel): inter-plane angle < 30 deg
-        #   T-shaped (perpendicular): inter-plane angle in [60, 90] deg
-        "pipi_dist": 5.5,
-        "pipi_offset": 2.0,
-        "pipi_angle_dev": 30.0,
-        # pi-cation: cation...ring-centroid distance, planar offset.
-        # PLIP PICATION_DIST_MAX = 6.0, offset <= 2.0.
-        "pication_dist": 6.0,
-        "pication_offset": 2.0,
-        # pi-alkyl: ring-centroid...aliphatic-carbon distance.
-        # DS-derived hydrophobic/pi contact ~4-6 A. UNCERTAIN.
-        "pialkyl_dist": 5.0,  # UNCERTAIN
-        # Alkyl-alkyl (hydrophobic C...C). PLIP HYDROPH_DIST_MAX = 4.0.
-        "alkyl_dist": 4.0,
-        # Halogen bond: X(Cl/Br/I)...acceptor(N/O/S) distance, C-X...A angle.
-        # PLIP HALOGEN_DIST_MAX = 4.0; C-X...A angle 165 +/- 30 => >= 135 deg.
-        "halogen_dist": 4.0,
-        "halogen_angle": 135.0,
-        # Metal coordination: metal ion...(O/N/S) distance. PLIP METAL_DIST_MAX = 3.0.
-        "metal_dist": 3.0,
-        # Water-mediated H-bond (bridge): each leg water-O...(donor/acceptor) heavy
-        # distance, plus angle at the water O. PLIP WATER_BRIDGE_MINDIST = 2.5,
-        # MAXDIST = 4.1, omega angle 75-140 deg.
-        "water_bridge_min": 2.5,
-        "water_bridge_max": 4.1,
-        "water_bridge_angle_min": 75.0,
-        "water_bridge_angle_max": 140.0,
-        # pi-sulfur: aromatic-ring centroid...S distance.
-        # Ringer et al. / Zauhar et al. report optimal ~5.3 A. UNCERTAIN (range 5.0-6.0).
-        "pi_sulfur_dist": 5.3,  # UNCERTAIN
-        # pi-anion: aromatic-ring centroid...anion distance + planar offset.
-        # Less standardised; ~5.0 A above the ring plane. UNCERTAIN (range 4.5-5.0).
-        "pi_anion_dist": 5.0,  # UNCERTAIN
-        "pi_anion_offset": 2.0,
-        # The three face-to-ring types are enabled only by the DS-calibrated
-        # engine; values are retained here so the table stays editable.
-        "pi_sigma_carbon_dist": 4.5,
-        "pi_sigma_h_centroid_dist": 4.3,
-        "pi_sigma_axis_angle": 40.0,
-        "pi_sigma_dha_angle": 160.0,
-        "pi_donor_dist": 5.2,
-        "pi_donor_h_centroid_dist": 4.1,
-        "pi_donor_axis_angle": 45.0,
-        "pi_donor_dha_angle": 145.0,
-        "pi_lone_pair_dist": 3.5,
-        "pi_lone_pair_angle": 30.0,
-    },
-    "ds": {
-        # DS conventional H-bond: D...A <= 3.5 A, angle floor ~90 deg (looser
-        # than PLIP's 100 deg). UNCERTAIN (proprietary, literature-derived).
-        "hbond_dist": 3.5,  # UNCERTAIN
-        "hbond_angle": 90.0,  # UNCERTAIN
-        "carbon_hbond_dist": 3.8,  # UNCERTAIN
-        "carbon_hbond_angle": 90.0,  # UNCERTAIN
-        # DS "Attractive Charge" electrostatic interaction: tighter than PLIP.
-        "saltbridge_dist": 5.0,  # UNCERTAIN
-        # DS Pi-Pi Stacked/T-shaped: looser distance + offset than PLIP.
-        "pipi_dist": 6.0,  # UNCERTAIN
-        "pipi_offset": 2.5,  # UNCERTAIN
-        "pipi_angle_dev": 30.0,
-        "pication_dist": 6.0,  # UNCERTAIN
-        "pication_offset": 2.5,  # UNCERTAIN
-        # Empirically calibrated on the 2m5d Discovery Studio annotations.
-        # Wider contacts occur visually, but inflating these global cutoffs
-        # created many false positives in the complete reference corpus.
-        "pialkyl_dist": 4.9,
-        "alkyl_dist": 4.2,
-        # DS halogen bond: near-linear geometry, angle floor ~140 deg.
-        "halogen_dist": 4.0,  # UNCERTAIN
-        "halogen_angle": 140.0,  # UNCERTAIN
-        "metal_dist": 3.0,
-        # Not formally defined by DS -- reuse PLIP/literature values.
-        "water_bridge_min": 2.5,
-        "water_bridge_max": 4.1,
-        "water_bridge_angle_min": 75.0,
-        "water_bridge_angle_max": 140.0,
-        "pi_sulfur_dist": 5.3,  # UNCERTAIN
-        "pi_anion_dist": 5.0,  # UNCERTAIN
-        "pi_anion_offset": 2.0,
-        # Direct DSV observations: pi-sigma H-centroid distances up to 4.29 A
-        # and theta up to 37.57 deg; pi-donor contacts up to 4.10 A / 44.07 deg.
-        "pi_sigma_carbon_dist": 4.5,
-        "pi_sigma_h_centroid_dist": 4.3,
-        "pi_sigma_axis_angle": 40.0,
-        "pi_sigma_dha_angle": 160.0,
-        "pi_donor_dist": 5.2,
-        "pi_donor_h_centroid_dist": 4.1,
-        "pi_donor_axis_angle": 45.0,
-        "pi_donor_dha_angle": 145.0,
-        "pi_lone_pair_dist": 3.5,
-        "pi_lone_pair_angle": 30.0,
-    },
-}
+def _cutoff_profile(engine):
+    preset = "dsv" if engine == "ds" else "plip"
+    values = dict(_docklens_core.cutoffs_for_preset(preset))
+    if engine == "plip":
+        # These channels are intentionally retained in the editable table even
+        # though DockLens calibrates them only in the DSV branch.
+        values.update(
+            {
+                "pi_sigma_carbon_dist": 4.5,
+                "pi_sigma_h_centroid_dist": 4.3,
+                "pi_sigma_axis_angle": 40.0,
+                "pi_sigma_dha_angle": 160.0,
+                "pi_donor_dist": 5.2,
+                "pi_donor_h_centroid_dist": 4.1,
+                "pi_donor_axis_angle": 45.0,
+                "pi_donor_dha_angle": 145.0,
+                "pi_lone_pair_dist": 3.5,
+                "pi_lone_pair_angle": 30.0,
+            }
+        )
+    return values
+
+
+CUTOFF_PROFILES = {engine: _cutoff_profile(engine) for engine in ("plip", "ds")}
 DETECTION_ENGINES = list(CUTOFF_PROFILES.keys())  # ["plip", "ds"]
 
 # Active cutoff table (mutated in place by interactions_set_engine /
 # interactions_set_cutoff so every detector, which reads the CUTOFFS global
 # directly, immediately sees the change).
-CUTOFFS = dict(CUTOFF_PROFILES["plip"])
-_active_engine = ["plip"]
+CUTOFFS = dict(CUTOFF_PROFILES["ds"])
+_active_engine = ["ds"]
+_last_parity_diagnostics = []
+_parity_customized = [False]
+_parity_source_integrity = [_parity_sources_are_reviewed()]
+
+MAX_ATOM_PAIRS = 5_000_000
+MAX_COMPUTE_COST_PER_FRAME = 10_000_000
+MAX_OCCUPANCY_COMPUTE_COST = 50_000_000
+MAX_DRAWN_INTERACTIONS = 2_000
+MAX_OCCUPANCY_FRAMES = 10_000
+_last_compute_cost = [0]
+_GROUP_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+_RESERVED_GROUP_NAMES = frozenset(
+    {"all", "everything", "none", "enabled", "disabled", "visible"}
+)
+
+
+def _parity_is_active():
+    return (
+        _active_engine[0] == "ds"
+        and not _parity_customized[0]
+        and _parity_source_integrity[0]
+        and not _last_parity_diagnostics
+    )
+
+
+def _estimate_compute_cost(n_receptor, n_ligand, n_waters, include_water):
+    atom_pairs = n_receptor * n_ligand
+    if not include_water:
+        return atom_pairs
+    return atom_pairs + n_waters * (
+        n_receptor + n_ligand + atom_pairs
+    )
+
 
 # Pristine copy of the *active engine's* defaults (for the GUI "Reset" in the
 # cutoff editor). Refreshed by interactions_set_engine on every switch.
@@ -400,6 +451,14 @@ class Atom(object):
         "coord",
         "fcharge",
         "neighbors",
+        "serial",
+        "subst_id",
+        "side",
+        "sybyl_type",
+        "partial_charge",
+        "bond_orders",
+        "model",
+        "pymol_index",
     )
 
     def __init__(self, idx, catom):
@@ -416,6 +475,32 @@ class Atom(object):
         except Exception:
             self.fcharge = 0
         self.neighbors = []  # list of Atom (filled from bonds)
+        self.serial = getattr(catom, "id", None)
+        if self.serial is None:
+            self.serial = idx + 1
+        self.subst_id = None
+        self.side = None
+        raw_type = getattr(catom, "text_type", "")
+        if not raw_type:
+            fallback_type = getattr(catom, "type", "")
+            raw_type = fallback_type if isinstance(fallback_type, str) else ""
+        self.sybyl_type = str(raw_type or "").strip()
+        if self.sybyl_type and self.sybyl_type != "??":
+            # DockLens' MOL2/PDBQT parsers treat their charge column as partial
+            # charge only. PyMOL may infer formal charges from the same types;
+            # ignoring that inference keeps the two pipelines identical.
+            self.fcharge = 0
+        try:
+            value = getattr(catom, "partial_charge", None)
+            self.partial_charge = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            self.partial_charge = None
+        self.bond_orders = {}
+        self.model = str(getattr(catom, "model", "") or "")
+        try:
+            self.pymol_index = int(getattr(catom, "index"))
+        except (AttributeError, TypeError, ValueError):
+            self.pymol_index = None
 
     def res_tag(self):
         chain = self.chain if self.chain else "_"
@@ -426,6 +511,14 @@ class Atom(object):
 
     def res_sele(self):
         """PyMOL selection string matching this atom's whole residue."""
+        model_name = getattr(self, "model", "")
+        pymol_index = getattr(self, "pymol_index", None)
+        if model_name and pymol_index is not None:
+            model = model_name.replace("\\", "\\\\").replace('"', '\\"')
+            return '(byres (model "%s" and index %d))' % (
+                model,
+                pymol_index,
+            )
         parts = ["resn %s" % self.resn, "resi \\%s" % self.resi]
         if self.chain:
             parts.append("chain %s" % self.chain)
@@ -434,14 +527,27 @@ class Atom(object):
         return "(" + " and ".join(parts) + ")"
 
 
-def _load_atoms(selection, state):
+def _load_atoms(selection, state, index_offset=0):
     """Return (atoms, has_hydrogen) for a selection at a given state."""
     model = cmd.get_model(selection, state=state)
-    atoms = [Atom(i, ca) for i, ca in enumerate(model.atom)]
+    atoms = [Atom(index_offset + i, ca) for i, ca in enumerate(model.atom)]
     for bond in model.bond:
         i, j = bond.index
         atoms[i].neighbors.append(atoms[j])
         atoms[j].neighbors.append(atoms[i])
+        raw_order = getattr(bond, "order", 1)
+        try:
+            numeric_order = float(raw_order)
+            if numeric_order == 4.0:
+                order = "ar"
+            elif numeric_order.is_integer():
+                order = str(int(numeric_order))
+            else:
+                order = str(numeric_order)
+        except (TypeError, ValueError):
+            order = str(raw_order or "1").strip().lower()
+        atoms[i].bond_orders[atoms[j].idx] = order
+        atoms[j].bond_orders[atoms[i].idx] = order
     has_h = any(a.elem == "H" for a in atoms)
     return atoms, has_h
 
@@ -521,6 +627,7 @@ _CATION_RES_ATOMS = {  # positively-charged centres
     "ARG": ["NH1", "NH2", "NE"],  # guanidinium -> averaged centre
     "HIS": ["ND1", "NE2"],  # protonated His (ambiguous; included)
     "HIP": ["ND1", "NE2"],
+    "HSP": ["ND1", "NE2"],
 }
 _ANION_RES_ATOMS = {  # negatively-charged centres
     "ASP": ["OD1", "OD2"],
@@ -534,12 +641,182 @@ _METALS = {"Na", "K", "Mg", "Ca", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Cd", "Hg"
 # Water residue names (for water-mediated H-bonds).
 _WATER_RESN = {"HOH", "WAT", "H2O", "SOL", "TIP", "TIP3", "TIP4", "SPC", "DOD"}
 
+_CHEM_NON_ACCEPTOR_SYBYL = {"n.am", "n.pl3", "n.4"}
+_CHEM_NON_DONOR_SYBYL = {"o.2", "o.co2"}
+_PROTEIN_NON_ACCEPTOR = {
+    ("ARG", "NE"),
+    ("ARG", "NH1"),
+    ("ARG", "NH2"),
+    ("ASN", "ND2"),
+    ("GLN", "NE2"),
+    ("HIS", "ND1"),
+    ("HIS", "NE2"),
+    ("HIP", "ND1"),
+    ("HIP", "NE2"),
+    ("HID", "ND1"),
+    ("HIE", "NE2"),
+    ("HSP", "ND1"),
+    ("HSP", "NE2"),
+    ("LYS", "NZ"),
+    ("TRP", "NE1"),
+}
+_PROTEIN_NON_DONOR_OXYGEN = {
+    ("ASN", "OD1"),
+    ("ASP", "OD1"),
+    ("ASP", "OD2"),
+    ("GLN", "OE1"),
+    ("GLU", "OE1"),
+    ("GLU", "OE2"),
+}
+_PROTEIN_HYDROXYL_DONORS = {
+    ("SER", "OG"),
+    ("THR", "OG1"),
+    ("TYR", "OH"),
+}
+_PROTEIN_RESIDUES = {
+    "ALA",
+    "ARG",
+    "ASN",
+    "ASP",
+    "CYS",
+    "GLN",
+    "GLU",
+    "GLY",
+    "HIS",
+    "ILE",
+    "LEU",
+    "LYS",
+    "MET",
+    "PHE",
+    "PRO",
+    "SER",
+    "THR",
+    "TRP",
+    "TYR",
+    "VAL",
+    "ASH",
+    "GLH",
+    "HID",
+    "HIE",
+    "HIP",
+    "HSP",
+    "CYM",
+    "CYX",
+}
+_PROTEIN_ALKYL_ATOMS = {
+    "ALA": {"CB"},
+    "VAL": {"CB", "CG1", "CG2"},
+    "LEU": {"CB", "CG", "CD1", "CD2"},
+    "ILE": {"CB", "CG1", "CG2", "CD1"},
+    "MET": {"CB", "CG", "CE"},
+    "PRO": {"CB", "CG", "CD"},
+    "CYS": {"CB"},
+    "CYM": {"CB"},
+    "CYX": {"CB"},
+}
+_BOND_ORDER_VALUES = {
+    "1": 1.0,
+    "2": 2.0,
+    "3": 3.0,
+    "ar": 1.5,
+    "am": 1.0,
+}
+
 
 def _h_neighbors(atom):
     return [n for n in atom.neighbors if n.elem == "H"]
 
 
-def classify(atoms, rings, has_h):
+def _sybyl(atom):
+    return str(getattr(atom, "sybyl_type", "") or "").strip().lower()
+
+
+def _heavy_neighbors(atom):
+    return [neighbor for neighbor in atom.neighbors if neighbor.elem != "H"]
+
+
+def _ring_has_aromatic_evidence(ring):
+    members = tuple(ring.atoms)
+    member_ids = {atom.idx for atom in members}
+    typed_aromatic = all(_sybyl(atom) in {"c.ar", "n.ar"} for atom in members)
+    bonded_aromatic = all(
+        sum(
+            str(atom.bond_orders.get(neighbor.idx, "")).lower() == "ar"
+            for neighbor in atom.neighbors
+            if neighbor.idx in member_ids
+        )
+        >= 2
+        for atom in members
+    )
+    return typed_aromatic or bonded_aromatic
+
+
+def _chemistry_aware_alkyl_carbon(atom):
+    residue = atom.resn.upper()
+    if residue in _PROTEIN_RESIDUES:
+        return atom.name.upper() in _PROTEIN_ALKYL_ATOMS.get(residue, set())
+    heavy = _heavy_neighbors(atom)
+    return bool(heavy) and all(neighbor.elem == "C" for neighbor in heavy)
+
+
+def _strict_group_is_cationic(resname, atoms):
+    if resname != "HIS":
+        return True
+    if any(atom.fcharge > 0 for atom in atoms):
+        return True
+    return len(atoms) >= 2 and all(_h_neighbors(atom) for atom in atoms)
+
+
+def _heavy_bond_order_sum(atom):
+    total = 0.0
+    for neighbor in _heavy_neighbors(atom):
+        raw_order = str(atom.bond_orders.get(neighbor.idx, "1")).lower()
+        total += _BOND_ORDER_VALUES.get(raw_order, 1.0)
+    return total
+
+
+def _chemistry_aware_acceptor(atom):
+    if atom.elem not in _HB_ACCEPTOR_ELEMS or atom.fcharge > 0:
+        return False
+    sybyl = _sybyl(atom)
+    if sybyl in _CHEM_NON_ACCEPTOR_SYBYL:
+        return False
+    if sybyl == "o.3" and _h_neighbors(atom):
+        return False
+    if atom.elem == "N":
+        residue_atom = (atom.resn.upper(), atom.name.upper())
+        if atom.name.upper() == "N" or residue_atom in _PROTEIN_NON_ACCEPTOR:
+            return False
+    return True
+
+
+def _chemistry_aware_donor(atom, allow_inferred_hydrogen=True):
+    if atom.elem not in _HB_DONOR_ELEMS:
+        return False
+    sybyl = _sybyl(atom)
+    if sybyl in _CHEM_NON_DONOR_SYBYL:
+        return False
+    if _h_neighbors(atom):
+        return True
+    if not allow_inferred_hydrogen:
+        return False
+    heavy = _heavy_neighbors(atom)
+    residue_atom = (atom.resn.upper(), atom.name.upper())
+    if atom.elem == "O":
+        if residue_atom in _PROTEIN_NON_DONOR_OXYGEN:
+            return False
+        available_valence = len(heavy) <= 1 and _heavy_bond_order_sum(atom) <= 1.0
+        return (sybyl == "o.3" and available_valence) or (
+            not sybyl and available_valence and residue_atom in _PROTEIN_HYDROXYL_DONORS
+        )
+    if sybyl in {"n.1", "n.2", "n.ar", "n.4"}:
+        return False
+    if atom.resn.upper() == "PRO" and atom.name.upper() == "N":
+        return False
+    return len(heavy) < 3 and _heavy_bond_order_sum(atom) < 3.0
+
+
+def classify(atoms, rings, has_h, chemistry_profile="plip"):
     """Return a dict of feature lists for one molecular side."""
     ring_atom_ids = set(a.idx for r in rings for a in r.atoms)
 
@@ -553,6 +830,8 @@ def classify(atoms, rings, has_h):
     alkyl_carbons = []  # sp3 aliphatic carbons
     metals = []  # metal ion atoms
     sulfurs = []  # S atoms (for pi-sulfur)
+    chemistry_aware = str(chemistry_profile).strip().lower() == "dsv"
+    side_has_explicit_hydrogens = any(atom.elem == "H" for atom in atoms)
 
     # --- charged centres from formal charge (ligands/ions) ---
     # Each charged centre is stored as (point, label, residue_selection).
@@ -571,6 +850,8 @@ def classify(atoms, rings, has_h):
         if a.resn in _ANION_RES_ATOMS and a.name in _ANION_RES_ATOMS[a.resn]:
             grouped_anion.setdefault((a.res_tag(), a.resn), []).append(a)
     for (res, resn), grp in grouped_cation.items():
+        if chemistry_aware and not _strict_group_is_cationic(resn, grp):
+            continue
         pt = _centroid([x.coord for x in grp])
         lbl = "%s_guan" % res if resn == "ARG" else "%s_%s" % (res, grp[0].name)
         cations.append((pt, lbl, grp[0].res_sele()))
@@ -578,34 +859,87 @@ def classify(atoms, rings, has_h):
         pt = _centroid([x.coord for x in grp])
         anions.append((pt, "%s_carboxyl" % res, grp[0].res_sele()))
 
+    if chemistry_aware:
+        grouped_cation_atoms = {
+            atom.idx for group in grouped_cation.values() for atom in group
+        }
+        grouped_anion_atoms = {
+            atom.idx for group in grouped_anion.values() for atom in group
+        }
+        for atom in atoms:
+            if (
+                _sybyl(atom) == "n.4"
+                and atom.fcharge <= 0
+                and atom.idx not in grouped_cation_atoms
+            ):
+                cations.append((atom.coord, atom.label(), atom.res_sele()))
+
+        sybyl_carboxylates = {}
+        for atom in atoms:
+            if (
+                _sybyl(atom) != "o.co2"
+                or atom.fcharge < 0
+                or atom.idx in grouped_anion_atoms
+            ):
+                continue
+            carbon_neighbors = [
+                neighbor for neighbor in _heavy_neighbors(atom) if neighbor.elem == "C"
+            ]
+            group_key = (
+                ("carbon", carbon_neighbors[0].idx)
+                if carbon_neighbors
+                else ("oxygen", atom.idx)
+            )
+            sybyl_carboxylates.setdefault(group_key, []).append(atom)
+        for group in sybyl_carboxylates.values():
+            point = _centroid([atom.coord for atom in group])
+            anions.append(
+                (point, "%s_carboxylate" % group[0].res_tag(), group[0].res_sele())
+            )
+
     # --- H-bond donors/acceptors, halogens, alkyl carbons ---
     for a in atoms:
-        if a.elem in _HB_ACCEPTOR_ELEMS:
-            # Exclude cationic N (e.g. ammonium/guanidinium) as acceptor.
-            if not (a.elem == "N" and a.fcharge > 0):
+        if chemistry_aware:
+            if _chemistry_aware_acceptor(a):
                 acceptors.append(a)
-        if a.elem in _HB_DONOR_ELEMS:
-            if has_h:
-                hs = _h_neighbors(a)
-                if hs:
-                    donors.append((a, hs))
-            else:
-                donors.append((a, []))  # heavy-atom-only mode
+            if _chemistry_aware_donor(
+                a,
+                allow_inferred_hydrogen=not side_has_explicit_hydrogens,
+            ):
+                donors.append((a, _h_neighbors(a)))
+        else:
+            if a.elem in _HB_ACCEPTOR_ELEMS:
+                if not (a.elem == "N" and a.fcharge > 0):
+                    acceptors.append(a)
+            if a.elem in _HB_DONOR_ELEMS:
+                if has_h:
+                    hs = _h_neighbors(a)
+                    if hs:
+                        donors.append((a, hs))
+                else:
+                    donors.append((a, []))  # heavy-atom-only mode
         if a.elem == "C":
             if has_h:
                 hs = _h_neighbors(a)
+                heavy_neighbors = _heavy_neighbors(a)
+                polarized = any(
+                    neighbor.elem in {"N", "O", "S", "F", "Cl", "Br", "I"}
+                    for neighbor in heavy_neighbors
+                )
                 if hs:
-                    carbon_donors.append((a, hs))
-                    # A topology-only plug-in cannot assign SYBYL C.3 types.
-                    # Excluding planar ring atoms is the conservative proxy used
-                    # here; the subsequent face/angle geometry is stringent.
-                    if a.idx not in ring_atom_ids:
+                    if not chemistry_aware or polarized:
+                        carbon_donors.append((a, hs))
+                    if _sybyl(a) in {"", "c.3"}:
                         sigma_donors.append((a, hs))
             # aliphatic carbon: not aromatic-ring member, bonded only to C/H
             if a.idx not in ring_atom_ids:
-                heavy = [n for n in a.neighbors if n.elem != "H"]
-                if heavy and all(n.elem == "C" for n in heavy):
-                    alkyl_carbons.append(a)
+                if chemistry_aware:
+                    if _chemistry_aware_alkyl_carbon(a):
+                        alkyl_carbons.append(a)
+                else:
+                    heavy = _heavy_neighbors(a)
+                    if heavy and all(n.elem == "C" for n in heavy):
+                        alkyl_carbons.append(a)
         if a.elem in _HALOGENS:
             cbonded = [n for n in a.neighbors if n.elem == "C"]
             if cbonded:
@@ -644,13 +978,65 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
     out = []
     for donor, hs in feat_a[donor_key]:
         for acc in feat_b["acceptors"]:
+            if donor.idx == acc.idx:
+                continue
             d = _dist(donor.coord, acc.coord)
             if d > dist_cut:
                 continue
-            if has_h and hs:
+            dsv_engine = _active_engine[0] == "ds"
+            if dsv_engine and hs:
+                prefix = "hbond" if itype == "hbond" else "carbon_hbond"
+                acceptor_bases = [
+                    neighbor for neighbor in acc.neighbors if neighbor.elem != "H"
+                ]
+                if not acceptor_bases:
+                    continue
+                for hydrogen in hs:
+                    hydrogen_distance = _dist(hydrogen.coord, acc.coord)
+                    if hydrogen_distance > CUTOFFS["%s_h_a_dist" % prefix]:
+                        continue
+                    donor_angle = _angle_at(hydrogen.coord, donor.coord, acc.coord)
+                    if donor_angle < angle_cut:
+                        continue
+                    acceptor_angle = max(
+                        _angle_at(acc.coord, hydrogen.coord, base.coord)
+                        for base in acceptor_bases
+                    )
+                    if acceptor_angle < CUTOFFS["%s_acceptor_angle" % prefix]:
+                        continue
+                    out.append(
+                        {
+                            "type": itype,
+                            "subtype": "",
+                            "a_label": donor.label(),
+                            "b_label": acc.label(),
+                            "a_point": donor.coord,
+                            "b_point": acc.coord,
+                            "a_sele": donor.res_sele(),
+                            "b_sele": acc.res_sele(),
+                            "chemistry_basis": "explicit_hydrogen",
+                            "confidence": "high",
+                            "hydrogen": hydrogen.label(),
+                            "hydrogen_acceptor_distance_A": hydrogen_distance,
+                            "donor_hydrogen_acceptor_angle_deg": donor_angle,
+                            "hydrogen_acceptor_base_angle_deg": acceptor_angle,
+                        }
+                    )
+                continue
+            if dsv_engine and not hs:
+                prefix = "hbond" if itype == "hbond" else "carbon_hbond"
+                if d > CUTOFFS["%s_inferred_dist" % prefix]:
+                    continue
+            if not dsv_engine and has_h and hs:
                 best = max(_angle_at(h.coord, donor.coord, acc.coord) for h in hs)
                 if best < angle_cut:
                     continue
+            chemistry_metadata = {}
+            if dsv_engine:
+                chemistry_metadata = {
+                    "chemistry_basis": "inferred_hydrogen",
+                    "confidence": "medium",
+                }
             out.append(
                 {
                     "type": itype,
@@ -661,6 +1047,7 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
                     "b_point": acc.coord,
                     "a_sele": donor.res_sele(),
                     "b_sele": acc.res_sele(),
+                    **chemistry_metadata,
                 }
             )
     return out
@@ -966,8 +1353,11 @@ def detect_metal(fa, fb):
 def detect_pi_sulfur(fa, fb):
     cut = CUTOFFS["pi_sulfur_dist"]
     out = []
+    dsv_engine = _active_engine[0] == "ds"
     for rings, sulfs in ((fa["rings"], fb["sulfurs"]), (fb["rings"], fa["sulfurs"])):
         for r in rings:
+            if dsv_engine and not _ring_has_aromatic_evidence(r):
+                continue
             for s in sulfs:
                 if _dist(r.centroid, s.coord) <= cut:
                     out.append(
@@ -1020,9 +1410,17 @@ def detect_pi_lone_pair(fa, fb):
                              (fb["acceptors"], fa["rings"])):
         for acceptor in acceptors:
             for ring in rings:
+                if not _ring_has_aromatic_evidence(ring):
+                    continue
                 distance = _dist(acceptor.coord, ring.centroid)
+                if distance > c["pi_lone_pair_dist"]:
+                    continue
+                direction = _v(acceptor.coord) - _v(ring.centroid)
+                norm = np.linalg.norm(direction)
+                if norm < 1e-6:
+                    continue
                 theta = _axis_angle(acceptor.coord, ring.centroid, ring.normal)
-                if distance > c["pi_lone_pair_dist"] or theta > c["pi_lone_pair_angle"]:
+                if theta > c["pi_lone_pair_angle"]:
                     continue
                 out.append(
                     {
@@ -1105,6 +1503,179 @@ _DETECTORS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# DockLens parity adapter
+# ---------------------------------------------------------------------------
+# The historical detector implementations above are retained for source
+# compatibility. Public detection is rebound here to the bundled, hash-identical
+# DockLens core, so drawing, counting, occupancy and CSV all consume the same
+# scientific records.
+
+
+def _chemistry_profile_for_engine():
+    return "dsv" if _active_engine[0] == "ds" else "plip"
+
+
+def _endpoint_atom(obj):
+    return obj.atoms[0] if hasattr(obj, "atoms") else obj
+
+
+def _endpoint_selection(obj):
+    return _endpoint_atom(obj).res_sele()
+
+
+def _adapt_docklens_record(interaction):
+    record = dict(interaction)
+    record["a_sele"] = _endpoint_selection(record["a_obj"])
+    record["b_sele"] = _endpoint_selection(record["b_obj"])
+
+    hydrogen = record.get("hydrogen_obj")
+    if hydrogen is not None:
+        record["hydrogen"] = hydrogen.label()
+        if record["type"] in {
+            "hbond",
+            "carbon_hbond",
+            "pi_sigma",
+            "pi_donor_hbond",
+        }:
+            donor_prefix = None
+            for prefix in ("a", "b"):
+                if "donor" in record.get("%s_role" % prefix, ""):
+                    donor_prefix = prefix
+                    break
+            if donor_prefix is not None:
+                # Discovery Studio draws explicit-H contacts from H to the
+                # acceptor/ring. Preserve the heavy donor in a_obj/b_obj for
+                # chemistry and CSV normalization, but use H for the figure.
+                record["%s_label" % donor_prefix] = hydrogen.label()
+                record["%s_point" % donor_prefix] = hydrogen.coord
+    hydrogen_distance = record.get("hydrogen_acceptor_distance")
+    donor_angle = record.get("donor_hydrogen_acceptor_angle")
+    acceptor_angle = record.get("hydrogen_acceptor_base_angle")
+    if record["type"] in {"pi_sigma", "pi_donor_hbond"}:
+        record["hydrogen_centroid_distance_A"] = hydrogen_distance
+        record["donor_hydrogen_centroid_angle_deg"] = donor_angle
+    else:
+        record["hydrogen_acceptor_distance_A"] = hydrogen_distance
+        record["donor_hydrogen_acceptor_angle_deg"] = donor_angle
+        record["hydrogen_acceptor_base_angle_deg"] = acceptor_angle
+    if "theta" in record:
+        record["theta_deg"] = record["theta"]
+    return record
+
+
+def _run_docklens_detector(name, feat_a, feat_b, has_h=False):
+    cutoff_token = _docklens_core._ACTIVE_CUTOFFS.set(dict(CUTOFFS))
+    chemistry_token = _docklens_core._ACTIVE_CHEMISTRY_PROFILE.set(
+        _chemistry_profile_for_engine()
+    )
+    try:
+        detector = getattr(_docklens_core, name)
+        if name in {"detect_hbond", "detect_carbon_hbond"}:
+            records = detector(feat_a, feat_b, has_h)
+        else:
+            records = detector(feat_a, feat_b)
+        return [_adapt_docklens_record(record) for record in records]
+    finally:
+        _docklens_core._ACTIVE_CHEMISTRY_PROFILE.reset(chemistry_token)
+        _docklens_core._ACTIVE_CUTOFFS.reset(cutoff_token)
+
+
+def classify(atoms, rings, has_h, chemistry_profile=None):  # noqa: F811
+    profile = chemistry_profile or _chemistry_profile_for_engine()
+    return _docklens_core.classify(
+        atoms,
+        rings,
+        has_h,
+        chemistry_profile=profile,
+    )
+
+
+Ring = _docklens_core.Ring  # noqa: F811
+
+
+def detect_hbond(fa, fb, has_h):  # noqa: F811
+    return _run_docklens_detector("detect_hbond", fa, fb, has_h)
+
+
+def detect_carbon_hbond(fa, fb, has_h):  # noqa: F811
+    return _run_docklens_detector("detect_carbon_hbond", fa, fb, has_h)
+
+
+def detect_saltbridge(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_saltbridge", fa, fb)
+
+
+def detect_pipi(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pipi", fa, fb)
+
+
+def detect_pication(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pication", fa, fb)
+
+
+def detect_pialkyl(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pialkyl", fa, fb)
+
+
+def detect_pi_sigma(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pi_sigma", fa, fb)
+
+
+def detect_alkyl(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_alkyl", fa, fb)
+
+
+def detect_halogen(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_halogen", fa, fb)
+
+
+def detect_metal(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_metal", fa, fb)
+
+
+def detect_pi_sulfur(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pi_sulfur", fa, fb)
+
+
+def detect_pi_anion(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pi_anion", fa, fb)
+
+
+def detect_pi_donor_hbond(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pi_donor_hbond", fa, fb)
+
+
+def detect_pi_lone_pair(fa, fb):  # noqa: F811
+    return _run_docklens_detector("detect_pi_lone_pair", fa, fb)
+
+
+_DETECTORS = {
+    "hbond": lambda fa, fb, h: detect_hbond(fa, fb, h),
+    "carbon_hbond": lambda fa, fb, h: detect_carbon_hbond(fa, fb, h),
+    "saltbridge": lambda fa, fb, h: detect_saltbridge(fa, fb),
+    "pipi": lambda fa, fb, h: detect_pipi(fa, fb),
+    "pication": lambda fa, fb, h: detect_pication(fa, fb),
+    "pialkyl": lambda fa, fb, h: detect_pialkyl(fa, fb),
+    "pi_sigma": lambda fa, fb, h: detect_pi_sigma(fa, fb),
+    "alkyl": lambda fa, fb, h: detect_alkyl(fa, fb),
+    "halogen": lambda fa, fb, h: detect_halogen(fa, fb),
+    "metal": lambda fa, fb, h: detect_metal(fa, fb),
+    "pi_sulfur": lambda fa, fb, h: detect_pi_sulfur(fa, fb),
+    "pi_anion": lambda fa, fb, h: detect_pi_anion(fa, fb),
+    "pi_donor_hbond": lambda fa, fb, h: detect_pi_donor_hbond(fa, fb),
+    "pi_lone_pair": lambda fa, fb, h: detect_pi_lone_pair(fa, fb),
+}
+
+
+def _matches_ds_like(interaction):
+    detail = types.SimpleNamespace(
+        interaction_type=interaction["type"],
+        distance_A=interaction.get("dist"),
+    )
+    return _docklens_analysis_profiles.detail_matches_profile(detail, "ds_like")
+
+
 # ===========================================================================
 # Drawing
 # ===========================================================================
@@ -1134,7 +1705,34 @@ def _pseudo_at(point):
     return "%s and resi %d" % (_HELPER, n)
 
 
-def _draw(interaction, group_name, keep_label):
+def _draw(interaction, group_name, keep_label, _water_leg=False):
+    if (
+        interaction["type"] == "water_bridge"
+        and interaction.get("water_obj") is not None
+        and not _water_leg
+    ):
+        water = interaction["water_obj"]
+        first_leg = dict(interaction)
+        first_leg.update(
+            {
+                "b_label": water.label(),
+                "b_point": water.coord,
+                "b_sele": water.res_sele(),
+            }
+        )
+        second_leg = dict(interaction)
+        second_leg.update(
+            {
+                "a_label": water.label(),
+                "a_point": water.coord,
+                "a_sele": water.res_sele(),
+            }
+        )
+        return (
+            _draw(first_leg, group_name, keep_label, _water_leg=True),
+            _draw(second_leg, group_name, keep_label, _water_leg=True),
+        )
+
     itype = interaction["type"]
     subtype = interaction["subtype"]
     name = _sanitize(
@@ -1238,7 +1836,28 @@ def _resolve_selection(sel):
     )
 
 
-def _load_waters(sel1, sel2, state):
+def _resolve_receptor_selection(sel):
+    """Make the DS default match DockLens' receptor scope, including metals."""
+    value = str(sel).strip()
+    if _active_engine[0] == "ds" and value.lower() == "polymer":
+        return "(polymer or metals)"
+    return sel
+
+
+def _validate_group_name(group_name):
+    """Protect PyMOL sessions from broad or malformed delete targets."""
+    value = str(group_name or "").strip()
+    if (
+        not _GROUP_NAME_PATTERN.fullmatch(value)
+        or value.lower() in _RESERVED_GROUP_NAMES
+    ):
+        raise ValueError(
+            "group_name must be a simple, non-reserved PyMOL object name"
+        )
+    return value
+
+
+def _load_waters(sel1, sel2, state, index_offset=0):
     """Water-oxygen Atom objects near either selection (for water bridges)."""
     resn = "+".join(sorted(_WATER_RESN))
     near = "(resn %s) and elem O and (byres (all within 5 of ((%s) or (%s))))" % (
@@ -1248,7 +1867,7 @@ def _load_waters(sel1, sel2, state):
     )
     if cmd.count_atoms(near) == 0:
         return []
-    waters, _has_h = _load_atoms(near, state)
+    waters, _has_h = _load_atoms(near, state, index_offset=index_offset)
     return waters
 
 
@@ -1259,24 +1878,87 @@ def _compute_interactions(sel1, sel2, req_types, state):
     'dist' (endpoint separation, Angstrom). Shared by detect_interactions,
     interactions_occupancy and interactions_export_csv.
     """
-    atoms1, has_h1 = _load_atoms(sel1, state)
-    atoms2, has_h2 = _load_atoms(sel2, state)
+    _last_compute_cost[0] = 0
+    atoms1, has_h1 = _load_atoms(sel1, state, index_offset=0)
+    atoms2, has_h2 = _load_atoms(sel2, state, index_offset=len(atoms1))
     if not atoms1 or not atoms2:
         return [], None
+    if len(atoms1) * len(atoms2) > MAX_ATOM_PAIRS:
+        raise ValueError(
+            "Selections are too large for an all-pairs analysis "
+            "(%d x %d atoms; limit %d pairs). Narrow sel1/sel2."
+            % (len(atoms1), len(atoms2), MAX_ATOM_PAIRS)
+        )
+    atom_keys_1 = {
+        (getattr(atom, "model", ""), getattr(atom, "pymol_index", None))
+        for atom in atoms1
+        if getattr(atom, "model", "")
+        and getattr(atom, "pymol_index", None) is not None
+    }
+    atom_keys_2 = {
+        (getattr(atom, "model", ""), getattr(atom, "pymol_index", None))
+        for atom in atoms2
+        if getattr(atom, "model", "")
+        and getattr(atom, "pymol_index", None) is not None
+    }
+    if atom_keys_1.intersection(atom_keys_2):
+        raise ValueError("sel1 and sel2 must be distinct, non-overlapping groups")
     has_h = has_h1 or has_h2
+    chemistry_profile = "dsv" if _active_engine[0] == "ds" else "plip"
+    for atom in atoms1:
+        atom.side = "receptor"
+    for atom in atoms2:
+        atom.side = "ligand"
+    waters = (
+        _load_waters(
+            sel1,
+            sel2,
+            state,
+            index_offset=len(atoms1) + len(atoms2),
+        )
+        if "water_bridge" in req_types
+        else []
+    )
+    for atom in waters:
+        atom.side = "water"
+    compute_cost = _estimate_compute_cost(
+        len(atoms1),
+        len(atoms2),
+        len(waters),
+        include_water="water_bridge" in req_types,
+    )
+    _last_compute_cost[0] = compute_cost
+    if compute_cost > MAX_COMPUTE_COST_PER_FRAME:
+        raise ValueError(
+            "Selections and waters exceed the per-frame processing budget "
+            "(estimated %d operations; limit %d)."
+            % (compute_cost, MAX_COMPUTE_COST_PER_FRAME)
+        )
 
-    feat1 = classify(atoms1, _build_rings(atoms1), has_h)
-    feat2 = classify(atoms2, _build_rings(atoms2), has_h)
-
-    inters = []
-    for itype in req_types:
-        if itype == "water_bridge":
-            waters = _load_waters(sel1, sel2, state)
-            inters.extend(detect_water_bridge(feat1, feat2, waters))
-        else:
-            inters.extend(_DETECTORS[itype](feat1, feat2, has_h))
-    for it in inters:
-        it["dist"] = _dist(it["a_point"], it["b_point"])
+    raw_interactions = _docklens_core.compute_interactions(
+        atoms1,
+        atoms2,
+        waters=waters,
+        types=req_types,
+        cutoffs=dict(CUTOFFS),
+        chemistry_profile=chemistry_profile,
+    )
+    inters = [_adapt_docklens_record(record) for record in raw_interactions]
+    if chemistry_profile == "dsv":
+        inters = [interaction for interaction in inters if _matches_ds_like(interaction)]
+        diagnostics = []
+        all_atoms = atoms1 + atoms2
+        if not any(atom.sybyl_type for atom in all_atoms):
+            diagnostics.append(
+                "SYBYL atom types are unavailable; DockLens PDB fallback is active"
+            )
+        if not any(atom.bond_orders for atom in all_atoms):
+            diagnostics.append(
+                "bond orders are unavailable; aromatic/valence evidence may be limited"
+            )
+        _last_parity_diagnostics[:] = diagnostics
+    else:
+        _last_parity_diagnostics[:] = []
     return inters, has_h
 
 
@@ -1285,7 +1967,7 @@ def detect_interactions(
     sel2="organic",
     types="all",
     state=1,
-    disable_native_hbond=0,
+    disable_native_hbond=1,
     group_name="interactions",
     label=0,
     show_residues=0,
@@ -1306,13 +1988,25 @@ def detect_interactions(
     if engine:
         interactions_set_engine(engine)
     _register_colors()
-    sel1 = _resolve_selection(sel1)
+    sel1 = _resolve_receptor_selection(_resolve_selection(sel1))
     sel2 = _resolve_selection(sel2)
     state = int(state)
     keep_label = int(label) != 0
     do_disable = int(disable_native_hbond) != 0
     do_residues = int(show_residues) != 0
     req_types = _parse_types(types)
+    group_name = _validate_group_name(group_name)
+
+    inters, has_h = _compute_interactions(sel1, sel2, req_types, state)
+    if has_h is None:
+        print("[interactions] empty selection (sel1 or sel2 has no atoms).")
+        return
+    if len(inters) > MAX_DRAWN_INTERACTIONS:
+        raise ValueError(
+            "Analysis found %d interactions; drawing is limited to %d. "
+            "Narrow the selections or export CSV instead."
+            % (len(inters), MAX_DRAWN_INTERACTIONS)
+        )
 
     # Fresh slate for this group + helper (idempotent re-run / per-frame redraw).
     cmd.delete(group_name)
@@ -1324,11 +2018,6 @@ def detect_interactions(
 
     if do_disable:
         _disable_native_hbonds()
-
-    inters, has_h = _compute_interactions(sel1, sel2, req_types, state)
-    if has_h is None:
-        print("[interactions] empty selection (sel1 or sel2 has no atoms).")
-        return
 
     counts = {}
     res_seles = set()
@@ -1351,6 +2040,19 @@ def detect_interactions(
     for itype in req_types:
         if counts.get(itype):
             print("    %-13s %d" % (itype, counts[itype]))
+    if _active_engine[0] == "ds":
+        if _parity_customized[0]:
+            status = "customized"
+        elif not _parity_source_integrity[0] or _last_parity_diagnostics:
+            status = "degraded"
+        else:
+            status = "active"
+        print(
+            "    DockLens / Discovery Studio-like parity: %s (%s)"
+            % (status, DSV_PARITY_CONTRACT)
+        )
+        for diagnostic in _last_parity_diagnostics:
+            print("    parity note: %s" % diagnostic)
     if do_residues and res_seles:
         print("    interacting residues shown as sticks in '%s_residues'" % group_name)
     if not has_h:
@@ -1389,18 +2091,55 @@ def interactions_occupancy(
     csv   path => also write the occupancy table to a CSV file.
     """
     _register_colors()
-    sel1 = _resolve_selection(sel1)
+    sel1 = _resolve_receptor_selection(_resolve_selection(sel1))
     sel2 = _resolve_selection(sel2)
     req_types = _parse_types(types)
     start = int(start)
-    end = int(end) or cmd.count_states(sel1) or 1
-    if end < start:
-        start, end = end, start
+    available_states = max(
+        int(cmd.count_states(sel1) or 1),
+        int(cmd.count_states(sel2) or 1),
+    )
+    end = int(end) or available_states
+    if start < 1 or end < start or end > available_states:
+        raise ValueError(
+            "State range must satisfy 1 <= start <= end <= %d"
+            % available_states
+        )
     nframes = end - start + 1
+    if nframes > MAX_OCCUPANCY_FRAMES:
+        raise ValueError(
+            "Occupancy analysis is limited to %d frames per run"
+            % MAX_OCCUPANCY_FRAMES
+        )
+    if int(draw):
+        _validate_group_name(group_name)
 
     tally = {}  # key -> [count, sample_inter]
+    total_compute_cost = 0
     for st in range(start, end + 1):
         inters, has_h = _compute_interactions(sel1, sel2, req_types, st)
+        total_compute_cost += _last_compute_cost[0]
+        if (
+            st == start
+            and nframes * _last_compute_cost[0]
+            > MAX_OCCUPANCY_COMPUTE_COST
+        ):
+            raise ValueError(
+                "Trajectory exceeds the combined processing budget "
+                "(estimated %d operations; limit %d). Narrow selections "
+                "or analyze fewer frames."
+                % (
+                    nframes * _last_compute_cost[0],
+                    MAX_OCCUPANCY_COMPUTE_COST,
+                )
+            )
+        if total_compute_cost > MAX_OCCUPANCY_COMPUTE_COST:
+            raise ValueError(
+                "Trajectory exceeds the combined processing budget "
+                "(accumulated %d operations; limit %d). Narrow selections "
+                "or analyze fewer frames."
+                % (total_compute_cost, MAX_OCCUPANCY_COMPUTE_COST)
+            )
         seen = set()
         for it in inters:
             key = _interaction_key(it)
@@ -1463,10 +2202,36 @@ def _write_csv(path, header, rows):
     """Minimal CSV writer (stdlib csv), used by occupancy + export."""
     import csv as _csvmod
 
-    with open(path, "w", newline="") as fh:
+    def safe_cell(value):
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+            return "'" + value
+        return value
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = _csvmod.writer(fh)
-        w.writerow(header)
-        w.writerows(rows)
+        w.writerow([safe_cell(value) for value in header])
+        w.writerows([[safe_cell(value) for value in row] for row in rows])
+
+
+def _normalized_interaction_endpoints(interaction):
+    endpoints = {}
+    for prefix in ("a", "b"):
+        obj = interaction["%s_obj" % prefix]
+        atom = _endpoint_atom(obj)
+        side = getattr(atom, "side", "") or prefix
+        endpoints[side] = {
+            "label": interaction["%s_label" % prefix],
+            "residue": atom.res_tag(),
+            "atom": (
+                interaction["%s_label" % prefix].rsplit("_", 1)[-1]
+                if hasattr(obj, "atoms")
+                else atom.name
+            ),
+            "serial": getattr(atom, "serial", None),
+            "role": interaction.get("%s_role" % prefix, ""),
+        }
+    empty = {"label": "", "residue": "", "atom": "", "serial": None, "role": ""}
+    return endpoints.get("receptor", empty), endpoints.get("ligand", empty)
 
 
 def interactions_export_csv(
@@ -1478,7 +2243,7 @@ def interactions_export_csv(
     explicit hydrogens are present; blank cells mean the metric is not used by
     that interaction class.
     """
-    sel1 = _resolve_selection(sel1)
+    sel1 = _resolve_receptor_selection(_resolve_selection(sel1))
     sel2 = _resolve_selection(sel2)
     state = int(state)
     req_types = _parse_types(types)
@@ -1486,27 +2251,75 @@ def interactions_export_csv(
     if has_h is None:
         print("[interactions] empty selection; nothing exported.")
         return
-    rows = [
-        [
-            state,
-            it["type"],
-            it["subtype"],
-            it["a_label"],
-            it["b_label"],
-            round(it["dist"], 2),
-            it.get("hydrogen", ""),
-            _round_metric(it.get("hydrogen_centroid_distance_A")),
-            _round_metric(it.get("donor_hydrogen_centroid_angle_deg")),
-            _round_metric(it.get("theta_deg")),
-        ]
-        for it in inters
-    ]
+    rows = []
+    for interaction in inters:
+        receptor, ligand = _normalized_interaction_endpoints(interaction)
+        hydrogen = interaction.get("hydrogen_obj")
+        rows.append(
+            [
+                state,
+                _chemistry_profile_for_engine(),
+                "ds_like" if _active_engine[0] == "ds" else "complete",
+                DSV_PARITY_CONTRACT if _active_engine[0] == "ds" else "",
+                _parity_is_active(),
+                interaction["type"],
+                interaction["subtype"],
+                receptor["residue"],
+                receptor["atom"],
+                receptor["serial"],
+                receptor["role"],
+                ligand["residue"],
+                ligand["atom"],
+                ligand["serial"],
+                ligand["role"],
+                round(interaction["dist"], 2),
+                interaction.get("chemistry_basis", ""),
+                interaction.get("confidence", ""),
+                hydrogen.label() if hydrogen is not None else "",
+                getattr(hydrogen, "serial", "") if hydrogen is not None else "",
+                _round_metric(interaction.get("hydrogen_acceptor_distance")),
+                _round_metric(interaction.get("donor_hydrogen_acceptor_angle")),
+                _round_metric(interaction.get("hydrogen_acceptor_base_angle")),
+                _round_metric(interaction.get("theta")),
+                _round_metric(interaction.get("receptor_water_distance")),
+                _round_metric(interaction.get("ligand_water_distance")),
+                _round_metric(interaction.get("water_angle")),
+                interaction["a_label"],
+                interaction["b_label"],
+            ]
+        )
     _write_csv(
         filename,
         [
-            "state", "type", "subtype", "partner_a", "partner_b", "distance_A",
-            "hydrogen", "hydrogen_centroid_distance_A",
-            "donor_hydrogen_centroid_angle_deg", "theta_deg",
+            "state",
+            "chemistry_profile",
+            "analysis_profile",
+            "parity_contract",
+            "parity_active",
+            "type",
+            "subtype",
+            "receptor_residue",
+            "receptor_atom",
+            "receptor_atom_serial",
+            "receptor_role",
+            "ligand_residue",
+            "ligand_atom",
+            "ligand_atom_serial",
+            "ligand_role",
+            "distance_A",
+            "chemistry_basis",
+            "chemistry_confidence",
+            "hydrogen_atom",
+            "hydrogen_atom_serial",
+            "hydrogen_acceptor_distance_A",
+            "donor_hydrogen_acceptor_angle_deg",
+            "hydrogen_acceptor_base_angle_deg",
+            "theta_deg",
+            "receptor_water_distance_A",
+            "ligand_water_distance_A",
+            "water_angle_deg",
+            "partner_a",
+            "partner_b",
         ],
         rows,
     )
@@ -1574,6 +2387,7 @@ def interactions_visibility(action="show", group_name="interactions"):
             'clear' -> delete the group, residue selection, legend and helper.
     """
     action = str(action).strip().lower()
+    group_name = _validate_group_name(group_name)
     targets = [group_name, "%s_residues" % group_name, "interactions_legend"]
     if action == "show":
         for t in targets:
@@ -1592,8 +2406,8 @@ def interactions_visibility(action="show", group_name="interactions"):
     print("[interactions] visibility '%s' applied." % action)
 
 
-def interactions_set_engine(engine="plip"):
-    """Switch the active detection engine: 'plip' (default) or 'ds'.
+def interactions_set_engine(engine="ds"):
+    """Switch the active detection engine: 'ds' (default) or 'plip'.
 
     Reloads CUTOFFS in place from CUTOFF_PROFILES[engine] and resets the
     per-engine defaults used by interactions_set_cutoff('reset', ...). Any
@@ -1609,6 +2423,8 @@ def interactions_set_engine(engine="plip"):
         return
     global _CUTOFF_DEFAULTS
     _active_engine[0] = engine
+    _parity_customized[0] = False
+    _last_parity_diagnostics[:] = []
     CUTOFFS.clear()
     CUTOFFS.update(CUTOFF_PROFILES[engine])
     _CUTOFF_DEFAULTS = dict(CUTOFFS)
@@ -1624,6 +2440,7 @@ def interactions_set_cutoff(key, value):
     if str(key).strip().lower() == "reset":
         CUTOFFS.clear()
         CUTOFFS.update(_CUTOFF_DEFAULTS)
+        _parity_customized[0] = False
         print("[interactions] all cutoffs reset to defaults.")
         return
     if key not in CUTOFFS:
@@ -1632,8 +2449,41 @@ def interactions_set_cutoff(key, value):
             % (key, ", ".join(sorted(CUTOFFS)))
         )
         return
-    CUTOFFS[key] = float(value)
+    parsed = float(value)
+    upper_bound = 180.0 if "angle" in key else 20.0
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= upper_bound:
+        raise ValueError(
+            "cutoff %s must be finite and between 0 and %.1f"
+            % (key, upper_bound)
+        )
+    CUTOFFS[key] = parsed
+    _parity_customized[0] = True
     print("[interactions] cutoff %s = %s" % (key, CUTOFFS[key]))
+    if _active_engine[0] == "ds":
+        print(
+            "[interactions] custom cutoff active: DockLens parity is disabled "
+            "until reset or engine re-selection."
+        )
+
+
+def interactions_parity_status():
+    """Print and return the active DockLens parity contract state."""
+    active = _parity_is_active()
+    status = {
+        "active": active,
+        "engine": _active_engine[0],
+        "contract": DSV_PARITY_CONTRACT,
+        "customized": _parity_customized[0],
+        "source_integrity": _parity_source_integrity[0],
+        "diagnostics": tuple(_last_parity_diagnostics),
+    }
+    print(
+        "[interactions] DockLens / Discovery Studio-like parity: %s (%s)"
+        % ("active" if active else "inactive", DSV_PARITY_CONTRACT)
+    )
+    for diagnostic in _last_parity_diagnostics:
+        print("    note: %s" % diagnostic)
+    return status
 
 
 def show_interaction_legend(onscreen=0, sele="all"):
@@ -1756,22 +2606,40 @@ def run_plugin_gui():
 
     if _dialog is None:
         _dialog = QtWidgets.QDialog()
-        _dialog.setWindowTitle("Non-Covalent Interactions")
+        _dialog.setWindowTitle("Non-Covalent Interactions %s" % PLUGIN_VERSION)
         form = _build_scrollable_form(QtWidgets, QtCore, _dialog)
 
         # Detection engine toggle (switch, like DockLens' engine switch).
         engine_box = QtWidgets.QGroupBox("Detection engine")
         ebox = QtWidgets.QHBoxLayout(engine_box)
-        rb_plip = QtWidgets.QRadioButton("PLIP-style (default)")
-        rb_ds = QtWidgets.QRadioButton("Discovery Studio-style")
+        rb_plip = QtWidgets.QRadioButton("PLIP-style")
+        rb_ds = QtWidgets.QRadioButton(
+            "DockLens / Discovery Studio-like (recommended)"
+        )
         rb_plip.setChecked(_active_engine[0] != "ds")
         rb_ds.setChecked(_active_engine[0] == "ds")
         ebox.addWidget(rb_plip)
         ebox.addWidget(rb_ds)
         form.addRow(engine_box)
-        rb_ds.toggled.connect(
-            lambda checked: interactions_set_engine("ds" if checked else "plip")
-        )
+        parity_label = QtWidgets.QLabel()
+        parity_label.setWordWrap(True)
+
+        def _update_parity_label():
+            if _parity_is_active():
+                text = "Parity active: %s" % DSV_PARITY_CONTRACT
+            elif _active_engine[0] == "ds":
+                text = "Parity degraded: check cutoffs and chemistry diagnostics"
+            else:
+                text = "PLIP mode: DockLens parity inactive"
+            parity_label.setText(text)
+
+        def _set_engine_from_gui(checked):
+            interactions_set_engine("ds" if checked else "plip")
+            _update_parity_label()
+
+        rb_ds.toggled.connect(_set_engine_from_gui)
+        _update_parity_label()
+        form.addRow("Scientific profile:", parity_label)
 
         sel1 = QtWidgets.QLineEdit("polymer")
         sel2 = QtWidgets.QLineEdit("organic")
@@ -1797,6 +2665,7 @@ def run_plugin_gui():
 
         auto_lig = QtWidgets.QCheckBox("Auto-detect ligand (ignore sel2)")
         disable_native = QtWidgets.QCheckBox("Hide PyMOL native H-bond dashes")
+        disable_native.setChecked(True)
         keep_label = QtWidgets.QCheckBox("Keep distance labels")
         show_res = QtWidgets.QCheckBox("Show interacting residues as sticks")
         onscreen = QtWidgets.QCheckBox("On-screen 3D legend")
@@ -2045,6 +2914,7 @@ cmd.extend("interactions_set_appearance", interactions_set_appearance)
 cmd.extend("interactions_visibility", interactions_visibility)
 cmd.extend("interactions_set_cutoff", interactions_set_cutoff)
 cmd.extend("interactions_set_engine", interactions_set_engine)
+cmd.extend("interactions_parity_status", interactions_parity_status)
 cmd.extend("show_interaction_legend", show_interaction_legend)
 cmd.extend("interactions_gui", run_plugin_gui)
 

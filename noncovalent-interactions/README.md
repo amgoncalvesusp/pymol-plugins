@@ -5,8 +5,13 @@ native H-bond dashes) as **individual, colour-coded dashed-line objects** for
 docking-pose and MD-trajectory analysis. Each interaction becomes its own named
 object in the side panel, ready for publication figures.
 
-Reference scope: Discovery Studio Visualizer / LUNA, with geometric criteria
-based on the open-source PLIP, Arpeggio and ProLIF families.
+The default analytical mode is the exact **DockLens DSV + Discovery
+Studio-like parity contract** used by DockLens 1.0. The PyMOL figure, CSV and
+trajectory occupancy therefore come from the same filtered interaction set as
+DockLens. This does not claim to reproduce BIOVIA's proprietary implementation
+internally.
+
+Parity contract: `docklens-dsv-2026.07`.
 
 ---
 
@@ -31,13 +36,15 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
   | `pi_anion` | ring–centre | Yellow (dotted) | 5.0 Å, offset 2.0 *(UNCERTAIN)* |
   | `pi_sigma` | ring–C-H | Reddish-purple (dotted) | DS-calibrated face geometry |
   | `pi_donor_hbond` | ring–N/O-H | Bluish-green (dotted) | DS-calibrated face geometry |
-  | `pi_lone_pair` | atom–ring | Yellow (dotted) | 3.5 Å, face angle ≤30° *(UNCERTAIN)* |
+  | `pi_lone_pair` | atom–ring | Sky-blue (dotted) | 3.5 Å, face angle ≤30° |
 
-- **Two selectable detection engines** — a switch, not a merge: `plip`
-  (default, Salentin et al. defaults) or `ds` (Discovery Studio
-  Visualizer-style thresholds, calibrated against a 150-pose 2m5d annotation
-  set). The DS engine additionally enables the three face-directed interaction
-  types above and applies residue-level pi-alkyl consolidation. Toggle with a
+- **Two selectable detection engines** — a switch, not a merge: `ds`
+  (default, exact DockLens parity) or `plip` (legacy Salentin et al. behavior).
+  The DS mode uses the bundled DockLens core, its `dsv` chemistry profile and
+  the final `ds_like` filter, including the 4.0 Å salt-bridge display limit.
+  Its default `polymer` receptor scope is expanded internally to
+  `polymer or metals`, matching DockLens for metalloproteins.
+  Toggle with a
   radio button in the GUI, or
   `interactions_set_engine ds` / `detect_interactions ..., engine=ds` on the
   command line.
@@ -68,14 +75,19 @@ based on the open-source PLIP, Arpeggio and ProLIF families.
 
 ## Installation
 
-### Option A — Plugin Manager, single file (simplest)
-1. `Plugin` ▸ `Plugin Manager` ▸ `Install New Plugin` ▸ `Choose file...`
-2. Select **`interactions_plugin.py`**.
-3. Restart PyMOL (or it loads immediately).
+### Option A — Plugin Manager, ZIP package (recommended)
 
-### Option B — Plugin Manager, zip package
 1. `Plugin` ▸ `Plugin Manager` ▸ `Install New Plugin` ▸ `Choose file...`
 2. Select **`pymol_interactions_plugin.zip`**.
+
+The ZIP contains the reviewed DockLens core needed for scientific parity.
+
+### Option B — repository checkout
+
+1. `Plugin` ▸ `Plugin Manager` ▸ `Install New Plugin` ▸ `Choose file...`
+2. Select **`interactions_plugin.py`**.
+3. Keep the adjacent `pymol_interactions_plugin/` directory in place because
+   the loader resolves the bundled core from that directory.
 
 ### Option C — no install, per-session
 ```python
@@ -113,10 +125,13 @@ detect_interactions polymer, organic, show_residues=1
 # auto-detect the ligand instead of naming sel2
 detect_interactions polymer, auto
 
-# switch detection engine: 'plip' (default) or 'ds' (Discovery Studio-style)
-interactions_set_engine ds
-detect_interactions polymer, organic                 # now uses DS cutoffs
-detect_interactions polymer, organic, engine=plip     # switch back inline
+# DockLens / Discovery Studio-like parity is active by default
+detect_interactions polymer, organic
+interactions_parity_status
+
+# optional legacy PLIP mode
+interactions_set_engine plip
+detect_interactions polymer, organic, engine=plip
 
 # MD trajectory: persistence (%) of each interaction over states 1..last
 interactions_occupancy polymer, organic
@@ -155,15 +170,15 @@ thickness / scale / label size), **Show / Hide / Clear** buttons, a per-type
 
 | Param | Default | Meaning |
 |-------|---------|---------|
-| `sel1` | `polymer` | Receptor side. Keep `sel1`/`sel2` as **distinct** groups. |
+| `sel1` | `polymer` | Receptor side. In DS mode this default includes receptor metals. Keep `sel1`/`sel2` as **distinct** groups. |
 | `sel2` | `organic` | Ligand side. |
 | `types` | `all` | Space/comma list, or `all`. Valid: `hbond carbon_hbond saltbridge pipi pication pialkyl alkyl halogen metal water_bridge pi_sulfur pi_anion pi_sigma pi_donor_hbond pi_lone_pair`. |
 | `state` | `1` | Model state used for coordinates (MD frame number). |
-| `disable_native_hbond` | `0` | `1` → hide PyMOL's own polar-contact/H-bond dashes. |
+| `disable_native_hbond` | `1` | `1` → hide PyMOL's own polar-contact/H-bond dashes. |
 | `group_name` | `interactions` | Side-panel group collecting every object. |
 | `label` | `0` | `1` → keep the numeric distance label on each dash. |
 | `show_residues` | `0` | `1` → show interacting residues as sticks in `<group_name>_residues`. |
-| `engine` | `''` (keep current) | `plip` or `ds` → switch detection engine before computing. |
+| `engine` | `''` (keep current; initially `ds`) | `plip` or `ds` → switch detection engine before computing. |
 
 ### Quick test
 
@@ -178,27 +193,29 @@ show_interaction_legend
 
 ## Notes & limitations
 
-- **Cutoffs** live in `CUTOFF_PROFILES` (`plip` and `ds`) at the top of
-  `interactions_plugin.py`; `CUTOFFS` is the active engine's table and is
-  editable at runtime. Each entry carries a source comment; values without a
-  firm literature consensus are flagged `UNCERTAIN`. The whole `ds` profile is
-  `UNCERTAIN` by nature — Discovery Studio Visualizer's exact thresholds are
-  proprietary. The DS engine has been empirically calibrated against a 2m5d
-  annotation corpus and selected tables, but remains a transparent
-  approximation rather than a byte-for-byte reproduction of DS's algorithm.
-- **Hydrogens**: with explicit H present, H-bond/halogen **angle** checks apply.
-  Without H, the plugin falls back to a heavy-atom distance-only mode and prints
-  a note — add hydrogens for stricter results.
-- **Ligand charge/aromaticity** relies on PDB `formal_charge` and ring
-  planarity. Ligands lacking assigned formal charges won't yield salt-bridge or
-  pi-cation contacts on that side; richer chemical typing would require RDKit
-  (intentionally out of scope).
+- **Parity scope** means equality with DockLens' transparent
+  `dsv + ds_like` interpretation. Discovery Studio Visualizer itself remains
+  proprietary.
+- **Cutoffs** may still be edited for exploratory work. Any edit marks the
+  profile as custom and disables the parity declaration until `reset` or a new
+  engine selection.
+- **Hydrogens**: explicit-H structures use H···A, D–H···A and H···A–Y
+  geometry. Without explicit H, the same conservative DockLens inferred-H
+  fallback is used.
+- **Chemical metadata**: MOL2/SYBYL types and bond orders are retained when
+  PyMOL exposes them. The plugin reports a parity diagnostic when it must use
+  the lower-information PDB fallback. For MOL2/PDBQT, PyMOL-inferred formal
+  charges are ignored because DockLens treats those formats' charge columns as
+  partial charges; PDB formal charges remain available.
 - Uses **only** the `pymol.cmd` API to draw and name objects.
 
 ---
 
 ## Files
 
-- `interactions_plugin.py` — the plugin (single file, canonical).
+- `interactions_plugin.py` — repository loader; keep the package directory next
+  to it.
 - `pymol_interactions_plugin/` — Plugin Manager package wrapper.
-- `pymol_interactions_plugin.zip` — packaged for zip install (Option B).
+- `pymol_interactions_plugin/docklens_core.py` — reviewed, hash-locked DockLens
+  scientific core.
+- `pymol_interactions_plugin.zip` — recommended Plugin Manager package.
