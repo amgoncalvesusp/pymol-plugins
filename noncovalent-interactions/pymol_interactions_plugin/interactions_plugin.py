@@ -22,13 +22,12 @@ USAGE (PyMOL command line)
   detect_interactions polymer, organic, state=5          # one MD frame
   detect_interactions polymer, organic, disable_native_hbond=1
   detect_interactions polymer, organic, show_residues=1  # residues as sticks
-  detect_interactions polymer, organic, engine=ds         # DS-style cutoffs
+  detect_interactions polymer, organic, engine=dsv        # DSV profile
 
 COMMANDS
   detect_interactions      detect + draw for one state (main command)
-  interactions_set_engine  switch detection engine: 'ds' (default) or 'plip'
-                           ('ds' is the DockLens parity contract); also
-                           a radio-button toggle in interactions_gui
+  interactions_set_engine  select plip, luna, dsv (default), or luna_dsv
+                           ('ds' remains a compatibility alias for dsv)
   interactions_occupancy   persistence (%) of each interaction over an MD
                            trajectory: loops states, prints/CSV a ranked table
   interactions_export_csv  dump one state's interactions to a CSV file
@@ -42,9 +41,7 @@ COMMANDS
   sel1  receptor side  (default 'polymer')
   sel2  ligand side    (default 'organic'; 'auto' -> organic else non-polymer)
         -- keep sel1/sel2 as DISTINCT groups
-  types space/comma list, or 'all'. Valid (15):
-        hbond carbon_hbond saltbridge pipi pication pialkyl alkyl halogen
-        metal water_bridge pi_sulfur pi_anion pi_sigma pi_donor_hbond pi_lone_pair
+  types space/comma list, or 'all' for the active profile's defaults.
   state  model state used for coordinates (1 = first; for a trajectory pass the
          frame number and re-run to recompute per frame).
   disable_native_hbond  1 => hide PyMOL's own polar-contact dashes to avoid
@@ -71,9 +68,9 @@ COLOURS  (Okabe-Ito, colour-blind-safe; see show_interaction_legend)
   metal          Vermillion  |  water_bridge  Sky-blue
   pi_sulfur      Reddish-purple  |  pi_anion   Yellow
 
-The default mode uses the bundled, reviewed DockLens interaction core and
-applies the same ``dsv`` chemistry plus ``ds_like`` analysis filter before
-drawing, counting, occupancy or CSV export. PLIP remains a separate mode.
+The default mode uses the bundled, reviewed DockLens interaction core with its
+native ``dsv`` criteria. PLIP, LUNA and conservative LUNA+DSV profiles remain
+selectable without a post-detection analysis filter.
 Ring perception is topology-based (bond-graph cycles +
 planarity heuristic) — no RDKit dependency.
 """
@@ -92,10 +89,10 @@ import numpy as np
 from pymol import cmd
 
 _EXPECTED_DOCKLENS_CORE_SHA256 = (
-    "dfdee432587c26f5cbd1025ecd110d160966b805083100aec2832970ae99af1b"
+    "9a19061c2cf1551a1d07836a973a840647be4c7ae58c22167f9ed35f23d6c76b"
 )
 _EXPECTED_ANALYSIS_PROFILE_SHA256 = (
-    "8f33342682f5ae5568ae7acc728f04584695d26facba22ff271cb8bf80341823"
+    "5132773cd6f6c908b20e1ee50face4e554bbf5d52fa25d9f8a19e2561c256148"
 )
 
 
@@ -163,8 +160,8 @@ except (ImportError, ValueError):
     _profiles_spec.loader.exec_module(_docklens_analysis_profiles)
 
 
-DSV_PARITY_CONTRACT = "docklens-dsv-2026.07"
-PLUGIN_VERSION = "0.4.1"
+DSV_PARITY_CONTRACT = "docklens-scientific-profiles-2026.08"
+PLUGIN_VERSION = "0.6.0"
 
 
 def _module_source_sha256(module):
@@ -225,8 +222,16 @@ INTERACTION_COLORS = dict(_docklens_core.INTERACTION_COLORS)
 
 # Extended types are rendered dotted to disambiguate the reused hue.
 _EXTENDED_TYPES = {
-    "metal", "water_bridge", "pi_sulfur", "pi_anion", "pi_sigma",
-    "pi_donor_hbond", "pi_lone_pair",
+    "attractive_charge",
+    "charge_repulsion",
+    "metal",
+    "water_bridge",
+    "pi_sulfur",
+    "pi_anion",
+    "pi_sigma",
+    "pi_donor_hbond",
+    "pi_lone_pair",
+    "chalcogen",
 }
 
 
@@ -248,6 +253,8 @@ _DASH_STYLE = {
     "hbond": (0.35, 0.35, 0.06),
     "carbon_hbond": (0.20, 0.45, 0.06),
     "saltbridge": (0.50, 0.25, 0.08),
+    "attractive_charge": (0.08, 0.32, 0.07),
+    "charge_repulsion": (0.08, 0.32, 0.07),
     "pipi": (0.50, 0.30, 0.07),  # sandwich default
     "pication": (0.40, 0.30, 0.07),
     "pialkyl": (0.25, 0.40, 0.06),
@@ -261,13 +268,14 @@ _DASH_STYLE = {
     "pi_sigma": (0.10, 0.32, 0.07),
     "pi_donor_hbond": (0.10, 0.32, 0.07),
     "pi_lone_pair": (0.08, 0.32, 0.07),
+    "chalcogen": (0.08, 0.32, 0.07),
 }
 _PIPI_SANDWICH_DASH = (0.60, 0.20, 0.08)  # long dash
 _PIPI_TSHAPED_DASH = (0.15, 0.45, 0.08)  # short dash
 
 
 # ===========================================================================
-# Geometric cutoffs  (edit here to override)  — two selectable engines
+# Geometric cutoffs (edit here to override) -- four scientific profiles
 # ===========================================================================
 #
 # Sources:
@@ -281,41 +289,20 @@ _PIPI_TSHAPED_DASH = (0.15, 0.45, 0.08)  # short dash
 #             is generally more permissive on distance and uses a looser
 #             donor-H...acceptor angle floor than PLIP.
 #
-# Same detection code (detect_hbond, detect_pipi, ...) runs under both
-# profiles; only the numeric thresholds in CUTOFFS change. water_bridge,
-# pi_sulfur and pi_anion are not formally defined by DS, so the "ds" profile
-# reuses the PLIP/literature values for those three.
-def _cutoff_profile(engine):
-    preset = "dsv" if engine == "ds" else "plip"
-    values = dict(_docklens_core.cutoffs_for_preset(preset))
-    if engine == "plip":
-        # These channels are intentionally retained in the editable table even
-        # though DockLens calibrates them only in the DSV branch.
-        values.update(
-            {
-                "pi_sigma_carbon_dist": 4.5,
-                "pi_sigma_h_centroid_dist": 4.3,
-                "pi_sigma_axis_angle": 40.0,
-                "pi_sigma_dha_angle": 160.0,
-                "pi_donor_dist": 5.2,
-                "pi_donor_h_centroid_dist": 4.1,
-                "pi_donor_axis_angle": 45.0,
-                "pi_donor_dha_angle": 145.0,
-                "pi_lone_pair_dist": 3.5,
-                "pi_lone_pair_angle": 30.0,
-            }
-        )
-    return values
-
-
-CUTOFF_PROFILES = {engine: _cutoff_profile(engine) for engine in ("plip", "ds")}
-DETECTION_ENGINES = list(CUTOFF_PROFILES.keys())  # ["plip", "ds"]
+# The bundled core owns the complete immutable snapshots and native criteria.
+_CANONICAL_PROFILES = ("plip", "luna", "dsv", "luna_dsv")
+_PROFILE_ALIASES = {"ds": "dsv"}
+CUTOFF_PROFILES = {
+    profile: dict(_docklens_core.cutoffs_for_preset(profile))
+    for profile in _CANONICAL_PROFILES
+}
+DETECTION_ENGINES = list(_CANONICAL_PROFILES)
 
 # Active cutoff table (mutated in place by interactions_set_engine /
 # interactions_set_cutoff so every detector, which reads the CUTOFFS global
 # directly, immediately sees the change).
-CUTOFFS = dict(CUTOFF_PROFILES["ds"])
-_active_engine = ["ds"]
+CUTOFFS = dict(CUTOFF_PROFILES["dsv"])
+_active_engine = ["dsv"]
 _last_parity_diagnostics = []
 _parity_customized = [False]
 _parity_source_integrity = [_parity_sources_are_reviewed()]
@@ -334,7 +321,7 @@ _RESERVED_GROUP_NAMES = frozenset(
 
 def _parity_is_active():
     return (
-        _active_engine[0] == "ds"
+        _active_engine[0] in _CANONICAL_PROFILES
         and not _parity_customized[0]
         and _parity_source_integrity[0]
         and not _last_parity_diagnostics
@@ -1513,7 +1500,7 @@ _DETECTORS = {
 
 
 def _chemistry_profile_for_engine():
-    return "dsv" if _active_engine[0] == "ds" else "plip"
+    return _active_engine[0]
 
 
 def _endpoint_atom(obj):
@@ -1606,6 +1593,14 @@ def detect_saltbridge(fa, fb):  # noqa: F811
     return _run_docklens_detector("detect_saltbridge", fa, fb)
 
 
+def detect_attractive_charge(fa, fb):
+    return _run_docklens_detector("detect_attractive_charge", fa, fb)
+
+
+def detect_charge_repulsion(fa, fb):
+    return _run_docklens_detector("detect_charge_repulsion", fa, fb)
+
+
 def detect_pipi(fa, fb):  # noqa: F811
     return _run_docklens_detector("detect_pipi", fa, fb)
 
@@ -1650,10 +1645,16 @@ def detect_pi_lone_pair(fa, fb):  # noqa: F811
     return _run_docklens_detector("detect_pi_lone_pair", fa, fb)
 
 
+def detect_chalcogen(fa, fb):
+    return _run_docklens_detector("detect_chalcogen", fa, fb)
+
+
 _DETECTORS = {
     "hbond": lambda fa, fb, h: detect_hbond(fa, fb, h),
     "carbon_hbond": lambda fa, fb, h: detect_carbon_hbond(fa, fb, h),
     "saltbridge": lambda fa, fb, h: detect_saltbridge(fa, fb),
+    "attractive_charge": lambda fa, fb, h: detect_attractive_charge(fa, fb),
+    "charge_repulsion": lambda fa, fb, h: detect_charge_repulsion(fa, fb),
     "pipi": lambda fa, fb, h: detect_pipi(fa, fb),
     "pication": lambda fa, fb, h: detect_pication(fa, fb),
     "pialkyl": lambda fa, fb, h: detect_pialkyl(fa, fb),
@@ -1665,10 +1666,12 @@ _DETECTORS = {
     "pi_anion": lambda fa, fb, h: detect_pi_anion(fa, fb),
     "pi_donor_hbond": lambda fa, fb, h: detect_pi_donor_hbond(fa, fb),
     "pi_lone_pair": lambda fa, fb, h: detect_pi_lone_pair(fa, fb),
+    "chalcogen": lambda fa, fb, h: detect_chalcogen(fa, fb),
 }
 
 
 def _matches_ds_like(interaction):
+    """Compatibility helper retained for callers; not used by detection."""
     detail = types.SimpleNamespace(
         interaction_type=interaction["type"],
         distance_A=interaction.get("dist"),
@@ -1771,9 +1774,14 @@ def _draw(interaction, group_name, keep_label, _water_leg=False):
 # ===========================================================================
 
 
+def _profile_default_types(profile=None):
+    active_profile = profile or _chemistry_profile_for_engine()
+    return list(_docklens_core.default_types_for_profile(active_profile))
+
+
 def _parse_types(types):
-    if types in (None, "", "all", "All", "ALL"):
-        return list(VALID_TYPES)
+    if types is None or str(types).strip().lower() in {"", "all"}:
+        return _profile_default_types()
     if isinstance(types, (list, tuple)):
         req = list(types)
     else:
@@ -1837,9 +1845,9 @@ def _resolve_selection(sel):
 
 
 def _resolve_receptor_selection(sel):
-    """Make the DS default match DockLens' receptor scope, including metals."""
+    """Make the DSV defaults match DockLens' receptor scope, including metals."""
     value = str(sel).strip()
-    if _active_engine[0] == "ds" and value.lower() == "polymer":
+    if _active_engine[0] in {"dsv", "luna_dsv"} and value.lower() == "polymer":
         return "(polymer or metals)"
     return sel
 
@@ -1904,7 +1912,7 @@ def _compute_interactions(sel1, sel2, req_types, state):
     if atom_keys_1.intersection(atom_keys_2):
         raise ValueError("sel1 and sel2 must be distinct, non-overlapping groups")
     has_h = has_h1 or has_h2
-    chemistry_profile = "dsv" if _active_engine[0] == "ds" else "plip"
+    chemistry_profile = _chemistry_profile_for_engine()
     for atom in atoms1:
         atom.side = "receptor"
     for atom in atoms2:
@@ -1944,8 +1952,7 @@ def _compute_interactions(sel1, sel2, req_types, state):
         chemistry_profile=chemistry_profile,
     )
     inters = [_adapt_docklens_record(record) for record in raw_interactions]
-    if chemistry_profile == "dsv":
-        inters = [interaction for interaction in inters if _matches_ds_like(interaction)]
+    if chemistry_profile != "plip":
         diagnostics = []
         all_atoms = atoms1 + atoms2
         if not any(atom.sybyl_type for atom in all_atoms):
@@ -1982,8 +1989,8 @@ def detect_interactions(
     sel2='auto' picks the ligand automatically (organic, else non-polymer).
     show_residues 1 => also display interacting residues as sticks in a
         selection named '<group_name>_residues'.
-    engine  '' (default) => keep the currently active engine; 'plip' or
-        'ds' => switch engine first (see interactions_set_engine).
+    engine  '' (default) keeps the active profile; plip, luna, dsv, luna_dsv,
+        or legacy ds switches profile first (see interactions_set_engine).
     """
     if engine:
         interactions_set_engine(engine)
@@ -2040,7 +2047,7 @@ def detect_interactions(
     for itype in req_types:
         if counts.get(itype):
             print("    %-13s %d" % (itype, counts[itype]))
-    if _active_engine[0] == "ds":
+    if _active_engine[0] in _CANONICAL_PROFILES:
         if _parity_customized[0]:
             status = "customized"
         elif not _parity_source_integrity[0] or _last_parity_diagnostics:
@@ -2048,18 +2055,24 @@ def detect_interactions(
         else:
             status = "active"
         print(
-            "    DockLens / Discovery Studio-like parity: %s (%s)"
-            % (status, DSV_PARITY_CONTRACT)
+            "    DockLens scientific profile '%s': %s (%s)"
+            % (_active_engine[0], status, DSV_PARITY_CONTRACT)
         )
         for diagnostic in _last_parity_diagnostics:
             print("    parity note: %s" % diagnostic)
     if do_residues and res_seles:
         print("    interacting residues shown as sticks in '%s_residues'" % group_name)
     if not has_h:
-        print(
-            "    note: no hydrogens in structure -> H-bond angle checks "
-            "skipped (heavy-atom distance mode). Add H for stricter results."
-        )
+        if _active_engine[0] in {"luna", "luna_dsv"}:
+            print(
+                "    note: no hydrogens in structure -> this profile requires "
+                "explicit donor H atoms, so donor-H interaction families are unavailable."
+            )
+        else:
+            print(
+                "    note: no hydrogens in structure -> H-bond angle checks "
+                "skipped where the profile permits heavy-atom fallback."
+            )
     return counts
 
 
@@ -2259,8 +2272,8 @@ def interactions_export_csv(
             [
                 state,
                 _chemistry_profile_for_engine(),
-                "ds_like" if _active_engine[0] == "ds" else "complete",
-                DSV_PARITY_CONTRACT if _active_engine[0] == "ds" else "",
+                "native",
+                DSV_PARITY_CONTRACT,
                 _parity_is_active(),
                 interaction["type"],
                 interaction["subtype"],
@@ -2352,30 +2365,281 @@ def interactions_figure_preset(ray=0, filename=""):
         print("[interactions] figure saved to %s" % filename)
 
 
-def interactions_set_appearance(
-    thickness=0.06, dash_scale=1.0, label_size=14, group_name="interactions"
-):
-    """Tune the appearance of the drawn interaction dashes.
+_SAFE_COLOR_NAMES = frozenset(
+    {
+        "black",
+        "blue",
+        "carbon",
+        "chartreuse",
+        "chocolate",
+        "cyan",
+        "dash",
+        "deepblue",
+        "firebrick",
+        "forest",
+        "gray",
+        "green",
+        "grey",
+        "hotpink",
+        "hydrogen",
+        "lime",
+        "limegreen",
+        "magenta",
+        "marine",
+        "nitrogen",
+        "olive",
+        "orange",
+        "oxygen",
+        "pink",
+        "purple",
+        "purpleblue",
+        "red",
+        "ruby",
+        "salmon",
+        "slate",
+        "sulfur",
+        "teal",
+        "tv_blue",
+        "tv_green",
+        "tv_red",
+        "violet",
+        "wheat",
+        "white",
+        "yellow",
+        "yelloworange",
+    }
+    | set(_OKABE_ITO)
+)
+_SAFE_COLOR_TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_HEX_COLOR_TOKEN = re.compile(r"^(?:#[0-9A-Fa-f]{6}|0x[0-9A-Fa-f]{6})$")
+_GRAY_COLOR_TOKEN = re.compile(r"^gr(?:a|e)y([0-9]{1,3})$")
 
-    thickness   dash radius (line thickness) applied to every dash object.
-    dash_scale  multiplier on each object's per-type dash length + gap, so the
-                sandwich/T-shaped/dotted encoding is preserved while scaling.
-    label_size  label text size for the interaction distance labels.
+
+def _validate_appearance_selection(value, name):
+    selection = str(value or "").strip()
+    if not selection or len(selection) > 4096:
+        raise ValueError("%s must be a non-empty PyMOL selection" % name)
+    if ";" in selection or any(ord(char) < 32 or ord(char) == 127 for char in selection):
+        raise ValueError("%s contains a command separator or control character" % name)
+    return selection
+
+
+def _validate_appearance_color(value, name):
+    if value is None:
+        return None
+    color = str(value).strip()
+    lowered = color.lower()
+    gray_match = _GRAY_COLOR_TOKEN.fullmatch(lowered)
+    valid_gray = gray_match is not None and int(gray_match.group(1)) <= 100
+    if _HEX_COLOR_TOKEN.fullmatch(color):
+        return color
+    if not _SAFE_COLOR_TOKEN.fullmatch(color) or not (
+        lowered in _SAFE_COLOR_NAMES
+        or valid_gray
+        or lowered.startswith("ii_")
+    ):
+        raise ValueError(
+            "%s must be a safe named PyMOL color or #RRGGBB/0xRRGGBB" % name
+        )
+    return color
+
+
+def _validate_appearance_float(value, name, lower, upper, allow_none=False):
+    if value is None and allow_none:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be numeric" % name)
+    if not math.isfinite(parsed) or not lower <= parsed <= upper:
+        raise ValueError(
+            "%s must be finite and between %s and %s" % (name, lower, upper)
+        )
+    return parsed
+
+
+def _validate_appearance_positive(value, name, upper, allow_none=False):
+    parsed = _validate_appearance_float(value, name, 0.0, upper, allow_none)
+    if parsed is not None and parsed <= 0.0:
+        raise ValueError("%s must be greater than zero" % name)
+    return parsed
+
+
+def _validate_appearance_bool(value, name, allow_none=False):
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("%s must be boolean (0/1 or true/false)" % name)
+
+
+def _validate_appearance_int(value, name, lower, upper, allow_none=False):
+    if value is None and allow_none:
+        return None
+    parsed = _validate_appearance_float(value, name, lower, upper)
+    if not parsed.is_integer():
+        raise ValueError("%s must be an integer" % name)
+    return int(parsed)
+
+
+def interactions_set_appearance(
+    thickness=0.06,
+    dash_scale=1.0,
+    label_size=14,
+    group_name="interactions",
+    protein_selection="polymer",
+    ligand_selection="organic",
+    protein_color=None,
+    ligand_color=None,
+    interacting_residue_color=None,
+    stick_radius=None,
+    nonbond_sphere_size=None,
+    cartoon_transparency=None,
+    background_color=None,
+    show_hydrogens=None,
+    transparency=None,
+    ambient=None,
+    specular=None,
+    ray_shadows=None,
+    ray_opaque_background=None,
+    antialias=None,
+    dash_thickness=None,
+    nonbond_sphere_scale=None,
+):
+    """Safely tune molecules, interaction objects, and render settings.
+
+    The original first four arguments remain positional-compatible. New scene
+    arguments are optional, so an old call still changes only dashes and labels.
+    Every argument is validated before the first mutating PyMOL call.
     """
-    thickness = float(thickness)
-    dash_scale = float(dash_scale)
+    validated_group = _validate_group_name(group_name)
+    protein_selection = _validate_appearance_selection(
+        protein_selection, "protein_selection"
+    )
+    ligand_selection = _validate_appearance_selection(
+        ligand_selection, "ligand_selection"
+    )
+    protein_color = _validate_appearance_color(protein_color, "protein_color")
+    ligand_color = _validate_appearance_color(ligand_color, "ligand_color")
+    interacting_residue_color = _validate_appearance_color(
+        interacting_residue_color, "interacting_residue_color"
+    )
+    thickness = _validate_appearance_positive(thickness, "thickness", 5.0)
+    dash_thickness = _validate_appearance_positive(
+        dash_thickness, "dash_thickness", 5.0, allow_none=True
+    )
+    effective_thickness = thickness if dash_thickness is None else dash_thickness
+    dash_scale = _validate_appearance_positive(dash_scale, "dash_scale", 100.0)
+    label_size = _validate_appearance_positive(label_size, "label_size", 1000.0)
+    stick_radius = _validate_appearance_positive(
+        stick_radius, "stick_radius", 10.0, allow_none=True
+    )
+    nonbond_sphere_size = _validate_appearance_positive(
+        nonbond_sphere_size, "nonbond_sphere_size", 10.0, allow_none=True
+    )
+    nonbond_sphere_scale = _validate_appearance_positive(
+        nonbond_sphere_scale, "nonbond_sphere_scale", 10.0, allow_none=True
+    )
+    sphere_size = (
+        nonbond_sphere_size
+        if nonbond_sphere_scale is None
+        else nonbond_sphere_scale
+    )
+    cartoon_transparency = _validate_appearance_float(
+        cartoon_transparency,
+        "cartoon_transparency",
+        0.0,
+        1.0,
+        allow_none=True,
+    )
+    transparency = _validate_appearance_float(
+        transparency, "transparency", 0.0, 1.0, allow_none=True
+    )
+    background_color = _validate_appearance_color(
+        background_color, "background_color"
+    )
+    show_hydrogens = _validate_appearance_bool(
+        show_hydrogens, "show_hydrogens", allow_none=True
+    )
+    ambient = _validate_appearance_float(
+        ambient, "ambient", 0.0, 1.0, allow_none=True
+    )
+    specular = _validate_appearance_float(
+        specular, "specular", 0.0, 1.0, allow_none=True
+    )
+    ray_shadows = _validate_appearance_bool(
+        ray_shadows, "ray_shadows", allow_none=True
+    )
+    ray_opaque_background = _validate_appearance_bool(
+        ray_opaque_background, "ray_opaque_background", allow_none=True
+    )
+    antialias = _validate_appearance_int(
+        antialias, "antialias", 0, 4, allow_none=True
+    )
+
+    molecule_selection = "(%s) or (%s)" % (
+        protein_selection,
+        ligand_selection,
+    )
+    residue_selection = "%s_residues" % validated_group
+    hydrogen_selection = "(%s) and elem H" % molecule_selection
+
+    if protein_color is not None:
+        cmd.color(protein_color, protein_selection)
+    if ligand_color is not None:
+        cmd.color(ligand_color, ligand_selection)
+    if interacting_residue_color is not None:
+        cmd.color(interacting_residue_color, residue_selection)
+    if stick_radius is not None:
+        cmd.set("stick_radius", stick_radius, molecule_selection)
+        cmd.set("stick_radius", stick_radius, residue_selection)
+    if sphere_size is not None:
+        cmd.set("sphere_scale", sphere_size, "nb_spheres")
+        cmd.set("nonbonded_size", sphere_size, "nonbonded")
+
     n = 0
     for name in list(_dash_base):
         base_l, base_g = _dash_base[name]
-        cmd.set("dash_radius", thickness, name)
+        cmd.set("dash_radius", effective_thickness, name)
         cmd.set("dash_length", base_l * dash_scale, name)
         cmd.set("dash_gap", base_g * dash_scale, name)
-        cmd.set("label_size", float(label_size), name)
+        cmd.set("label_size", label_size, name)
         n += 1
+
+    if cartoon_transparency is not None:
+        cmd.set("cartoon_transparency", cartoon_transparency, protein_selection)
+    if transparency is not None:
+        cmd.set("transparency", transparency, molecule_selection)
+    if show_hydrogens is True:
+        cmd.show("sticks", hydrogen_selection)
+    elif show_hydrogens is False:
+        cmd.hide("everything", hydrogen_selection)
+    if background_color is not None:
+        cmd.bg_color(background_color)
+    for setting, value in (
+        ("ambient", ambient),
+        ("specular", specular),
+        ("ray_shadows", None if ray_shadows is None else int(ray_shadows)),
+        (
+            "ray_opaque_background",
+            None if ray_opaque_background is None else int(ray_opaque_background),
+        ),
+        ("antialias", antialias),
+    ):
+        if value is not None:
+            cmd.set(setting, value)
+
     print(
         "[interactions] appearance applied to %d dash object(s) "
         "(thickness=%.3f, dash_scale=%.2f, label_size=%s)"
-        % (n, thickness, dash_scale, label_size)
+        % (n, effective_thickness, dash_scale, label_size)
     )
     return n
 
@@ -2406,29 +2670,34 @@ def interactions_visibility(action="show", group_name="interactions"):
     print("[interactions] visibility '%s' applied." % action)
 
 
-def interactions_set_engine(engine="ds"):
-    """Switch the active detection engine: 'ds' (default) or 'plip'.
+def interactions_set_engine(engine="dsv"):
+    """Select plip, luna, dsv, or luna_dsv (legacy ``ds`` aliases dsv).
 
     Reloads CUTOFFS in place from CUTOFF_PROFILES[engine] and resets the
     per-engine defaults used by interactions_set_cutoff('reset', ...). Any
     cutoff values manually edited via interactions_set_cutoff or the "Edit
     cutoffs..." dialog under the previous engine are discarded on switch.
     """
-    engine = str(engine).strip().lower()
+    requested = str(engine).strip().lower()
+    engine = _PROFILE_ALIASES.get(requested, requested)
     if engine not in CUTOFF_PROFILES:
         print(
-            "[interactions] unknown engine '%s'. Valid: %s"
-            % (engine, ", ".join(DETECTION_ENGINES))
+            "[interactions] unknown scientific profile '%s'. Valid: %s"
+            % (requested, ", ".join(DETECTION_ENGINES))
         )
         return
-    global _CUTOFF_DEFAULTS
+    global _CUTOFF_DEFAULTS, _cutoff_dialog
     _active_engine[0] = engine
     _parity_customized[0] = False
     _last_parity_diagnostics[:] = []
     CUTOFFS.clear()
     CUTOFFS.update(CUTOFF_PROFILES[engine])
     _CUTOFF_DEFAULTS = dict(CUTOFFS)
-    print("[interactions] detection engine set to '%s'." % engine)
+    if _cutoff_dialog is not None:
+        _cutoff_dialog.hide()
+        _cutoff_dialog.deleteLater()
+        _cutoff_dialog = None
+    print("[interactions] scientific profile set to '%s'." % engine)
 
 
 def interactions_set_cutoff(key, value):
@@ -2459,27 +2728,33 @@ def interactions_set_cutoff(key, value):
     CUTOFFS[key] = parsed
     _parity_customized[0] = True
     print("[interactions] cutoff %s = %s" % (key, CUTOFFS[key]))
-    if _active_engine[0] == "ds":
-        print(
-            "[interactions] custom cutoff active: DockLens parity is disabled "
-            "until reset or engine re-selection."
-        )
+    print(
+        "[interactions] custom cutoff active: the locked scientific-profile "
+        "contract is disabled until reset or profile re-selection."
+    )
 
 
 def interactions_parity_status():
-    """Print and return the active DockLens parity contract state."""
+    """Print and return the locked DockLens scientific-profile contract state."""
     active = _parity_is_active()
     status = {
         "active": active,
         "engine": _active_engine[0],
+        "profile": _chemistry_profile_for_engine(),
+        "analysis_profile": "native",
+        "plugin_version": PLUGIN_VERSION,
         "contract": DSV_PARITY_CONTRACT,
         "customized": _parity_customized[0],
         "source_integrity": _parity_source_integrity[0],
         "diagnostics": tuple(_last_parity_diagnostics),
     }
     print(
-        "[interactions] DockLens / Discovery Studio-like parity: %s (%s)"
-        % ("active" if active else "inactive", DSV_PARITY_CONTRACT)
+        "[interactions] DockLens scientific profile '%s': %s (%s)"
+        % (
+            _active_engine[0],
+            "active" if active else "inactive",
+            DSV_PARITY_CONTRACT,
+        )
     )
     for diagnostic in _last_parity_diagnostics:
         print("    note: %s" % diagnostic)
@@ -2609,53 +2884,51 @@ def run_plugin_gui():
         _dialog.setWindowTitle("Non-Covalent Interactions %s" % PLUGIN_VERSION)
         form = _build_scrollable_form(QtWidgets, QtCore, _dialog)
 
-        # Detection engine toggle (switch, like DockLens' engine switch).
-        engine_box = QtWidgets.QGroupBox("Detection engine")
-        ebox = QtWidgets.QHBoxLayout(engine_box)
-        rb_plip = QtWidgets.QRadioButton("PLIP-style")
-        rb_ds = QtWidgets.QRadioButton(
-            "DockLens / Discovery Studio-like (recommended)"
-        )
-        rb_plip.setChecked(_active_engine[0] != "ds")
-        rb_ds.setChecked(_active_engine[0] == "ds")
-        ebox.addWidget(rb_plip)
-        ebox.addWidget(rb_ds)
-        form.addRow(engine_box)
+        profile_combo = QtWidgets.QComboBox()
+        profile_combo.addItems(["plip", "luna", "dsv", "luna_dsv"])
+        profile_combo.setCurrentText(_active_engine[0])
+        form.addRow("Scientific profile:", profile_combo)
         parity_label = QtWidgets.QLabel()
         parity_label.setWordWrap(True)
 
         def _update_parity_label():
-            if _parity_is_active():
-                text = "Parity active: %s" % DSV_PARITY_CONTRACT
-            elif _active_engine[0] == "ds":
-                text = "Parity degraded: check cutoffs and chemistry diagnostics"
-            else:
-                text = "PLIP mode: DockLens parity inactive"
-            parity_label.setText(text)
+            state_text = "active" if _parity_is_active() else "degraded/custom"
+            parity_label.setText(
+                "DockLens profile %s: %s (%s)"
+                % (_active_engine[0], state_text, DSV_PARITY_CONTRACT)
+            )
 
-        def _set_engine_from_gui(checked):
-            interactions_set_engine("ds" if checked else "plip")
-            _update_parity_label()
-
-        rb_ds.toggled.connect(_set_engine_from_gui)
         _update_parity_label()
-        form.addRow("Scientific profile:", parity_label)
+        form.addRow("Profile status:", parity_label)
 
         sel1 = QtWidgets.QLineEdit("polymer")
         sel2 = QtWidgets.QLineEdit("organic")
         form.addRow("Receptor (sel1):", sel1)
         form.addRow("Ligand (sel2):", sel2)
 
-        # interaction-type checkboxes (all ticked by default)
+        # Profile defaults prevent non-inflating modes from selecting all 18.
         types_box = QtWidgets.QGroupBox("Interaction types")
         tgrid = QtWidgets.QGridLayout(types_box)
         checks = {}
+        default_types = set(_profile_default_types())
         for i, itype in enumerate(VALID_TYPES):
             cb = QtWidgets.QCheckBox(itype)
-            cb.setChecked(True)
+            cb.setChecked(itype in default_types)
             checks[itype] = cb
             tgrid.addWidget(cb, i // 2, i % 2)
         form.addRow(types_box)
+
+        def _refresh_profile_defaults():
+            enabled_types = set(_profile_default_types())
+            for interaction_type, checkbox in checks.items():
+                checkbox.setChecked(interaction_type in enabled_types)
+
+        def _set_profile_from_gui(profile):
+            interactions_set_engine(str(profile))
+            _refresh_profile_defaults()
+            _update_parity_label()
+
+        profile_combo.currentTextChanged.connect(_set_profile_from_gui)
 
         state = QtWidgets.QSpinBox()
         state.setMinimum(1)
@@ -2694,23 +2967,61 @@ def run_plugin_gui():
         ogrid.addRow("Min occupancy %:", occ_thr)
         form.addRow(occ_box)
 
-        # Appearance controls (apply live to the drawn dashes)
-        app_box = QtWidgets.QGroupBox("Appearance (live)")
+        # Full scene appearance controls; applied explicitly after validation.
+        app_box = QtWidgets.QGroupBox("Appearance and render controls")
         agrid = QtWidgets.QFormLayout(app_box)
+
+        def _double_control(minimum, maximum, step, value):
+            control = QtWidgets.QDoubleSpinBox()
+            control.setRange(minimum, maximum)
+            control.setSingleStep(step)
+            control.setValue(value)
+            return control
+
+        protein_color = QtWidgets.QLineEdit("gray70")
+        ligand_color = QtWidgets.QLineEdit("orange")
+        residue_color = QtWidgets.QLineEdit("marine")
+        background_color = QtWidgets.QLineEdit("white")
+        stick_radius = _double_control(0.01, 2.0, 0.01, 0.20)
+        nonbond_sphere_size = _double_control(0.01, 2.0, 0.01, 0.25)
         thick = QtWidgets.QDoubleSpinBox()
         thick.setRange(0.01, 0.50)
         thick.setSingleStep(0.01)
         thick.setValue(0.06)
-        dscale = QtWidgets.QDoubleSpinBox()
-        dscale.setRange(0.2, 4.0)
-        dscale.setSingleStep(0.1)
-        dscale.setValue(1.0)
+        dscale = _double_control(0.2, 4.0, 0.1, 1.0)
         lsize = QtWidgets.QSpinBox()
         lsize.setRange(6, 40)
         lsize.setValue(14)
+        cartoon_transparency = _double_control(0.0, 1.0, 0.05, 0.25)
+        object_transparency = _double_control(0.0, 1.0, 0.05, 0.0)
+        ambient = _double_control(0.0, 1.0, 0.05, 0.35)
+        specular = _double_control(0.0, 1.0, 0.05, 0.2)
+        antialias = QtWidgets.QSpinBox()
+        antialias.setRange(0, 4)
+        antialias.setValue(2)
+        show_hydrogens = QtWidgets.QCheckBox("Show hydrogens as sticks")
+        ray_shadows = QtWidgets.QCheckBox("Ray shadows")
+        ray_opaque_background = QtWidgets.QCheckBox("Ray opaque background")
+        apply_appearance = QtWidgets.QPushButton("Apply appearance")
+
+        agrid.addRow("Protein color:", protein_color)
+        agrid.addRow("Ligand color:", ligand_color)
+        agrid.addRow("Interacting residue color:", residue_color)
+        agrid.addRow("Stick radius:", stick_radius)
+        agrid.addRow("Nonbond sphere size:", nonbond_sphere_size)
         agrid.addRow("Dash thickness:", thick)
         agrid.addRow("Dash length/gap scale:", dscale)
         agrid.addRow("Label size:", lsize)
+        agrid.addRow("Cartoon transparency:", cartoon_transparency)
+        agrid.addRow("Object transparency:", object_transparency)
+        agrid.addRow("Background color:", background_color)
+        agrid.addRow(show_hydrogens)
+        agrid.addRow("Ambient:", ambient)
+        agrid.addRow("Specular:", specular)
+        agrid.addRow(ray_shadows)
+        agrid.addRow(ray_opaque_background)
+        agrid.addRow("Antialias:", antialias)
+        agrid.addRow(apply_appearance)
         form.addRow(app_box)
 
         summary = QtWidgets.QLabel("No interactions drawn yet.")
@@ -2755,15 +3066,41 @@ def run_plugin_gui():
             return [t for t, cb in checks.items() if cb.isChecked()]
 
         def _apply_appearance():
-            interactions_set_appearance(
-                thickness=thick.value(),
-                dash_scale=dscale.value(),
-                label_size=lsize.value(),
-            )
+            protein_selection, ligand_selection = _sels()
+            if ligand_selection == "auto":
+                ligand_selection = sel2.text().strip() or "organic"
+            try:
+                interactions_set_appearance(
+                    protein_selection=protein_selection,
+                    ligand_selection=ligand_selection,
+                    protein_color=protein_color.text(),
+                    ligand_color=ligand_color.text(),
+                    interacting_residue_color=residue_color.text(),
+                    stick_radius=stick_radius.value(),
+                    nonbond_sphere_size=nonbond_sphere_size.value(),
+                    dash_thickness=thick.value(),
+                    dash_scale=dscale.value(),
+                    label_size=lsize.value(),
+                    cartoon_transparency=cartoon_transparency.value(),
+                    background_color=background_color.text(),
+                    show_hydrogens=show_hydrogens.isChecked(),
+                    transparency=object_transparency.value(),
+                    ambient=ambient.value(),
+                    specular=specular.value(),
+                    ray_shadows=ray_shadows.isChecked(),
+                    ray_opaque_background=ray_opaque_background.isChecked(),
+                    antialias=antialias.value(),
+                )
+            except Exception as exc:
+                summary.setText("Appearance error: %s" % exc)
+                return False
+            return True
 
         def _run():
             chosen = _chosen()
             if not chosen:
+                return
+            if not _apply_appearance():
                 return
             s1, s2 = _sels()
             counts = detect_interactions(
@@ -2775,7 +3112,7 @@ def run_plugin_gui():
                 label=1 if keep_label.isChecked() else 0,
                 show_residues=1 if show_res.isChecked() else 0,
             )
-            _apply_appearance()  # honour current appearance settings
+            _apply_appearance()  # apply to the freshly rebuilt dash objects
             if onscreen.isChecked():
                 show_interaction_legend(onscreen=1)
             if counts:
@@ -2828,11 +3165,7 @@ def run_plugin_gui():
         b_fig.clicked.connect(lambda: interactions_figure_preset())
         b_adv.clicked.connect(_open_cutoff_editor)
         b_close.clicked.connect(_dialog.hide)
-
-        # live appearance updates
-        thick.valueChanged.connect(_apply_appearance)
-        dscale.valueChanged.connect(_apply_appearance)
-        lsize.valueChanged.connect(_apply_appearance)
+        apply_appearance.clicked.connect(_apply_appearance)
 
     _dialog.show()
     _dialog.raise_()
@@ -2879,7 +3212,11 @@ def _open_cutoff_editor():
         def _apply():
             for key, sp in spins.items():
                 CUTOFFS[key] = float(sp.value())
-            print("[interactions] cutoffs updated (re-run Detect to apply).")
+            _parity_customized[0] = True
+            print(
+                "[interactions] custom cutoffs updated; the locked profile "
+                "contract is disabled until reset or profile re-selection."
+            )
 
         def _reset():
             interactions_set_cutoff("reset", 0)

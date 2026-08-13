@@ -7,6 +7,7 @@ geometry and feature code be tested in a regular Python environment.
 import importlib.util
 import importlib
 import hashlib
+import inspect
 import os
 import sys
 import types
@@ -33,6 +34,174 @@ def _load_plugin():
 
 
 plugin = _load_plugin()
+
+
+_CANONICAL_PROFILES = ("plip", "luna", "dsv", "luna_dsv")
+
+
+def _canonical_profile_name(name):
+    value = str(name).strip().lower()
+    return "dsv" if value == "ds" else value
+
+
+def _profile_snapshot(profiles, canonical_name):
+    if canonical_name in profiles:
+        return profiles[canonical_name]
+    if canonical_name == "dsv" and "ds" in profiles:
+        return profiles["ds"]
+    pytest.fail("missing cutoff profile %r" % canonical_name)
+
+
+_EXPECTED_CANONICAL_INTERACTION_COLORS = {
+    "hbond": ("skyblue", "Hydrogen bond (conventional)"),
+    "carbon_hbond": ("bluishgreen", "Carbon H-bond (weak, C-H...O/N)"),
+    "saltbridge": ("vermillion", "Salt bridge / ionic"),
+    "attractive_charge": ("orange", "Attractive charge interaction"),
+    "charge_repulsion": ("vermillion", "Repulsive charge interaction"),
+    "pipi": ("reddishpurple", "pi-pi stacking (sandwich/T-shaped)"),
+    "pication": ("yellow", "pi-cation"),
+    "pialkyl": ("orange", "pi-alkyl"),
+    "pi_sigma": ("reddishpurple", "pi-sigma"),
+    "alkyl": ("blue", "Alkyl-alkyl (hydrophobic)"),
+    "halogen": ("black", "Halogen bond"),
+    "metal": ("vermillion", "Metal coordination"),
+    "water_bridge": ("skyblue", "Water-mediated H-bond"),
+    "pi_sulfur": ("reddishpurple", "pi-sulfur"),
+    "pi_anion": ("yellow", "pi-anion"),
+    "pi_donor_hbond": ("bluishgreen", "pi-donor hydrogen bond"),
+    "pi_lone_pair": ("skyblue", "Lone pair-pi"),
+    "chalcogen": ("black", "Chalcogen bond (S/Se/Te)"),
+}
+
+
+_APPEARANCE_PARAMETER_ALIASES = {
+    "protein_selection": (
+        "protein_selection",
+        "receptor_selection",
+        "protein",
+        "sel1",
+    ),
+    "ligand_selection": ("ligand_selection", "ligand", "sel2"),
+    "protein_color": ("protein_color", "receptor_color"),
+    "ligand_color": ("ligand_color",),
+    "interacting_residue_color": (
+        "interacting_residue_color",
+        "interaction_residue_color",
+        "residue_color",
+    ),
+    "stick_radius": ("stick_radius",),
+    "nonbond_sphere_size": (
+        "nonbond_sphere_scale",
+        "nonbond_sphere_radius",
+        "nonbonded_size",
+        "sphere_scale",
+        "sphere_radius",
+    ),
+    "dash_thickness": ("dash_thickness", "thickness"),
+    "dash_scale": ("dash_scale",),
+    "label_size": ("label_size",),
+    "cartoon_transparency": ("cartoon_transparency",),
+    "background_color": ("background_color", "bg_color"),
+    "show_hydrogens": ("show_hydrogens", "hydrogens"),
+    "transparency": (
+        "transparency",
+        "object_transparency",
+        "global_transparency",
+    ),
+}
+
+_APPEARANCE_DEFAULTS = {
+    "protein_selection": "polymer and chain A",
+    "ligand_selection": "organic and resn LIG",
+    "protein_color": "gray70",
+    "ligand_color": "orange",
+    "interacting_residue_color": "marine",
+    "stick_radius": 0.22,
+    "nonbond_sphere_size": 0.31,
+    "dash_thickness": 0.09,
+    "dash_scale": 1.5,
+    "label_size": 18,
+    "cartoon_transparency": 0.25,
+    "background_color": "white",
+    "show_hydrogens": True,
+    "transparency": 0.15,
+}
+
+_OPTIONAL_RENDER_PARAMETERS = {
+    "ambient": 0.35,
+    "specular": 0.2,
+    "ray_shadows": 0,
+    "ray_opaque_background": 0,
+    "antialias": 2,
+}
+
+
+def _appearance_parameter_name(semantic):
+    parameters = inspect.signature(plugin.interactions_set_appearance).parameters
+    for candidate in _APPEARANCE_PARAMETER_ALIASES[semantic]:
+        if candidate in parameters:
+            return candidate
+    pytest.fail(
+        "appearance API does not expose %s (accepted names: %s)"
+        % (semantic, ", ".join(_APPEARANCE_PARAMETER_ALIASES[semantic]))
+    )
+
+
+def _appearance_kwargs(**overrides):
+    values = dict(_APPEARANCE_DEFAULTS)
+    values.update(overrides)
+    kwargs = {
+        _appearance_parameter_name(semantic): value
+        for semantic, value in values.items()
+    }
+    parameters = inspect.signature(plugin.interactions_set_appearance).parameters
+    if "group_name" in parameters:
+        kwargs["group_name"] = "interactions"
+    for name, value in _OPTIONAL_RENDER_PARAMETERS.items():
+        if name in parameters:
+            kwargs[name] = value
+    return kwargs
+
+
+def _record_pymol_mutations(monkeypatch):
+    calls = []
+
+    def recorder(command):
+        def record(*args, **kwargs):
+            calls.append((command, args, kwargs))
+
+        return record
+
+    for command in ("bg_color", "color", "hide", "set", "show"):
+        monkeypatch.setattr(plugin.cmd, command, recorder(command), raising=False)
+    return calls
+
+
+def _setting_was_applied(calls, names, expected):
+    for command, args, _kwargs in calls:
+        if command != "set" or len(args) < 2 or args[0] not in names:
+            continue
+        try:
+            if float(args[1]) == pytest.approx(float(expected)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _color_was_applied(calls, color, selection_fragment):
+    for command, args, _kwargs in calls:
+        if command == "color" and len(args) >= 2:
+            if args[0] == color and selection_fragment in str(args[1]).lower():
+                return True
+        if command == "set" and len(args) >= 3:
+            if (
+                str(args[0]).endswith("_color")
+                and args[1] == color
+                and selection_fragment in str(args[2]).lower()
+            ):
+                return True
+    return False
 
 
 class _FakeDialog:
@@ -147,6 +316,30 @@ def test_gui_size_is_capped_by_available_high_dpi_screen():
     assert initial == (328, 352)
 
 
+def test_gui_source_exposes_four_profiles_and_full_appearance_controls():
+    source = inspect.getsource(plugin.run_plugin_gui).lower()
+
+    for profile in _CANONICAL_PROFILES:
+        assert profile in source
+
+    required_control_terms = (
+        ("protein", "color"),
+        ("ligand", "color"),
+        ("residue", "color"),
+        ("stick", "radius"),
+        ("nonbond", "sphere"),
+        ("dash", "thickness"),
+        ("dash", "scale"),
+        ("label", "size"),
+        ("cartoon", "transparency"),
+        ("background", "color"),
+        ("hydrogen",),
+    )
+    for terms in required_control_terms:
+        assert all(term in source for term in terms), terms
+    assert "transparency" in source.replace("cartoon_transparency", "")
+
+
 def test_gui_entrypoint_creates_a_real_scroll_area(monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     QtCore = pytest.importorskip("PyQt5.QtCore")
@@ -214,36 +407,227 @@ def _ring():
     return plugin.Ring(atoms, "PHE34_ring")
 
 
+def test_engine_choices_expose_the_four_canonical_profiles():
+    choices = {
+        _canonical_profile_name(name) for name in plugin.DETECTION_ENGINES
+    }
+
+    assert choices == set(_CANONICAL_PROFILES)
+
+
+@pytest.mark.parametrize("profile", _CANONICAL_PROFILES)
+def test_each_canonical_profile_can_be_selected(profile):
+    original = plugin._active_engine[0]
+    try:
+        plugin.interactions_set_engine("plip")
+        plugin.interactions_set_engine(profile)
+
+        assert _canonical_profile_name(plugin._active_engine[0]) == profile
+        assert plugin.CUTOFFS == dict(
+            _profile_snapshot(plugin.CUTOFF_PROFILES, profile)
+        )
+    finally:
+        plugin.interactions_set_engine(original)
+
+
+def test_legacy_ds_alias_selects_the_dsv_profile():
+    original = plugin._active_engine[0]
+    try:
+        plugin.interactions_set_engine("plip")
+        plugin.interactions_set_engine("ds")
+
+        assert _canonical_profile_name(plugin._active_engine[0]) == "dsv"
+        assert plugin.CUTOFFS == dict(
+            _profile_snapshot(plugin.CUTOFF_PROFILES, "dsv")
+        )
+    finally:
+        plugin.interactions_set_engine(original)
+
+
+@pytest.mark.parametrize("profile", _CANONICAL_PROFILES)
+def test_cutoff_profiles_match_bundled_docklens_snapshots(profile):
+    core_profiles = plugin._docklens_core.HBOND_PRESETS
+    core_choices = {_canonical_profile_name(name) for name in core_profiles}
+
+    assert profile in core_choices
+    expected = dict(plugin._docklens_core.cutoffs_for_preset(profile))
+    actual = dict(_profile_snapshot(plugin.CUTOFF_PROFILES, profile))
+    assert actual == expected
+
+
+def test_canonical_interaction_colors_exactly_match_bundled_core():
+    assert (
+        plugin._docklens_core.INTERACTION_COLORS
+        == _EXPECTED_CANONICAL_INTERACTION_COLORS
+    )
+    assert plugin.INTERACTION_COLORS == plugin._docklens_core.INTERACTION_COLORS
+    assert plugin.VALID_TYPES == list(_EXPECTED_CANONICAL_INTERACTION_COLORS)
+
+
+def test_luna_charge_families_do_not_double_count_one_ionic_pair():
+    cation = _atom(1, "N", (0, 0, 0), "N1", fcharge=1)
+    anion = _atom(2, "O", (3.0, 0, 0), "O1", fcharge=-1)
+    cation.side = "receptor"
+    anion.side = "ligand"
+
+    records = plugin._docklens_core.compute_interactions(
+        [cation],
+        [anion],
+        types=["saltbridge", "attractive_charge"],
+        chemistry_profile="luna",
+    )
+
+    assert [record["type"] for record in records] == ["saltbridge"]
+
+
+def test_appearance_api_applies_scene_and_interaction_settings(
+    monkeypatch,
+):
+    calls = _record_pymol_mutations(monkeypatch)
+    monkeypatch.setattr(
+        plugin,
+        "_dash_base",
+        {"hbond_dash": (0.35, 0.35)},
+    )
+
+    plugin.interactions_set_appearance(**_appearance_kwargs())
+
+    assert _color_was_applied(calls, "gray70", "polymer")
+    assert _color_was_applied(calls, "orange", "organic")
+    assert _color_was_applied(calls, "marine", "residu")
+    assert _setting_was_applied(calls, {"stick_radius"}, 0.22)
+    assert _setting_was_applied(
+        calls,
+        {
+            "nonbond_sphere_radius",
+            "nonbond_sphere_scale",
+            "nonbonded_size",
+            "sphere_radius",
+            "sphere_scale",
+        },
+        0.31,
+    )
+    assert _setting_was_applied(calls, {"dash_radius"}, 0.09)
+    assert _setting_was_applied(calls, {"dash_length"}, 0.525)
+    assert _setting_was_applied(calls, {"dash_gap"}, 0.525)
+    assert _setting_was_applied(calls, {"label_size"}, 18)
+    assert _setting_was_applied(calls, {"cartoon_transparency"}, 0.25)
+    assert _setting_was_applied(calls, {"transparency"}, 0.15)
+    assert any(
+        command == "bg_color" and args and args[0] == "white"
+        for command, args, _kwargs in calls
+    )
+    assert any(
+        command == "show"
+        and args
+        and any(
+            marker in " ".join(str(arg).lower() for arg in args)
+            for marker in ("elem h", "hydro")
+        )
+        for command, args, _kwargs in calls
+    )
+
+    parameters = inspect.signature(
+        plugin.interactions_set_appearance
+    ).parameters
+    for name, expected in _OPTIONAL_RENDER_PARAMETERS.items():
+        if name in parameters:
+            assert _setting_was_applied(calls, {name}, expected)
+
+
+def test_appearance_api_can_hide_hydrogens(monkeypatch):
+    calls = _record_pymol_mutations(monkeypatch)
+    monkeypatch.setattr(plugin, "_dash_base", {})
+
+    plugin.interactions_set_appearance(
+        **_appearance_kwargs(show_hydrogens=False)
+    )
+
+    assert any(
+        command == "hide"
+        and args
+        and any(
+            marker in " ".join(str(arg).lower() for arg in args)
+            for marker in ("elem h", "hydro")
+        )
+        for command, args, _kwargs in calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("semantic", "invalid"),
+    (
+        ("protein_selection", "polymer; delete all"),
+        ("ligand_selection", "organic\nhide everything"),
+        ("protein_color", "red; delete all"),
+        ("ligand_color", "#12GG00"),
+        ("interacting_residue_color", ""),
+    ),
+)
+def test_appearance_rejects_invalid_text_without_pymol_commands(
+    monkeypatch,
+    semantic,
+    invalid,
+):
+    calls = _record_pymol_mutations(monkeypatch)
+
+    with pytest.raises(ValueError):
+        plugin.interactions_set_appearance(
+            **_appearance_kwargs(**{semantic: invalid})
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("semantic", "invalid"),
+    (
+        ("stick_radius", 0.0),
+        ("nonbond_sphere_size", float("nan")),
+        ("dash_thickness", -0.01),
+        ("dash_scale", float("inf")),
+        ("label_size", 0),
+        ("cartoon_transparency", 1.01),
+        ("transparency", -0.01),
+    ),
+)
+def test_appearance_rejects_invalid_numbers_without_pymol_commands(
+    monkeypatch,
+    semantic,
+    invalid,
+):
+    calls = _record_pymol_mutations(monkeypatch)
+
+    with pytest.raises(ValueError):
+        plugin.interactions_set_appearance(
+            **_appearance_kwargs(**{semantic: invalid})
+        )
+
+    assert calls == []
+
+
 def test_ds_profile_matches_calibrated_geometry():
     plip = plugin.CUTOFF_PROFILES["plip"]
-    ds = plugin.CUTOFF_PROFILES["ds"]
-    assert plugin.DSV_PARITY_CONTRACT == "docklens-dsv-2026.07"
-    assert {
-        key: value
-        for key, value in plip.items()
-        if key not in {"pi_lone_pair_dist", "pi_lone_pair_angle"}
-    } == dict(plugin._docklens_core.cutoffs_for_preset("plip"))
-    assert plip["pi_lone_pair_dist"] == 3.5
-    assert plip["pi_lone_pair_angle"] == 30.0
-    assert ds == dict(plugin._docklens_core.cutoffs_for_preset("dsv"))
+    dsv = _profile_snapshot(plugin.CUTOFF_PROFILES, "dsv")
+    assert plugin.DSV_PARITY_CONTRACT == "docklens-scientific-profiles-2026.08"
+    assert plip == dict(plugin._docklens_core.cutoffs_for_preset("plip"))
+    assert dsv == dict(plugin._docklens_core.cutoffs_for_preset("dsv"))
     assert plugin.VALID_TYPES == plugin._docklens_core.VALID_TYPES
     assert plugin.INTERACTION_COLORS == plugin._docklens_core.INTERACTION_COLORS
-    assert ds["hbond_dist"] == 4.1
-    assert ds["hbond_h_a_dist"] == 3.1
-    assert ds["hbond_acceptor_angle"] == 90.0
-    assert ds["hbond_inferred_dist"] == 3.5
-    assert ds["carbon_hbond_h_a_dist"] == 3.0
-    assert ds["pialkyl_dist"] == 4.9
-    assert ds["alkyl_dist"] == 4.2
-    assert ds["metal_dist"] == 3.0
-    assert ds["pi_sigma_h_centroid_dist"] == 4.3
-    assert ds["pi_donor_h_centroid_dist"] == 4.1
-    assert ds["pi_lone_pair_dist"] == 3.5
-    assert ds["pi_lone_pair_angle"] == 30.0
+    assert dsv["hbond_dist"] == 3.4
+    assert dsv["hbond_acceptor_angle"] == 90.0
+    assert dsv["carbon_hbond_dist"] == 3.8
+    assert dsv["pialkyl_dist"] == 5.5
+    assert dsv["alkyl_dist"] == 5.5
+    assert dsv["metal_dist"] == 3.0
+    assert dsv["pi_sigma_carbon_dist"] == 4.0
+    assert dsv["pi_donor_dist"] == 4.2
+    assert dsv["pi_lone_pair_dist"] == 3.0
+    assert dsv["pi_lone_pair_angle"] == 45.0
     assert {"pi_sigma", "pi_donor_hbond", "pi_lone_pair"} <= set(plugin.VALID_TYPES)
 
 
-def test_bundled_core_is_the_reviewed_docklens_core():
+def test_bundled_core_matches_the_plugin_reviewed_digest():
     path = (
         Path(__file__).parents[1]
         / "pymol_interactions_plugin"
@@ -251,10 +635,10 @@ def test_bundled_core_is_the_reviewed_docklens_core():
     )
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    assert digest == "dfdee432587c26f5cbd1025ecd110d160966b805083100aec2832970ae99af1b"
+    assert digest == plugin._EXPECTED_DOCKLENS_CORE_SHA256
 
 
-def test_bundled_analysis_profile_copy_is_present():
+def test_bundled_analysis_profile_matches_the_plugin_reviewed_digest():
     path = (
         Path(__file__).parents[1]
         / "pymol_interactions_plugin"
@@ -262,7 +646,7 @@ def test_bundled_analysis_profile_copy_is_present():
     )
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    assert digest == "8f33342682f5ae5568ae7acc728f04584695d26facba22ff271cb8bf80341823"
+    assert digest == plugin._EXPECTED_ANALYSIS_PROFILE_SHA256
 
 
 def test_unreviewed_fallback_module_is_rejected_before_import(tmp_path):
@@ -291,12 +675,10 @@ def test_plugin_manager_package_imports_the_bundled_core():
     )
 
     assert packaged.DSV_PARITY_CONTRACT == plugin.DSV_PARITY_CONTRACT
-    assert {
-        key: value
-        for key, value in packaged.CUTOFF_PROFILES["plip"].items()
-        if key not in {"pi_lone_pair_dist", "pi_lone_pair_angle"}
-    } == dict(packaged._docklens_core.cutoffs_for_preset("plip"))
-    assert packaged.CUTOFF_PROFILES["ds"] == dict(
+    assert packaged.CUTOFF_PROFILES["plip"] == dict(
+        packaged._docklens_core.cutoffs_for_preset("plip")
+    )
+    assert _profile_snapshot(packaged.CUTOFF_PROFILES, "dsv") == dict(
         packaged._docklens_core.cutoffs_for_preset("dsv")
     )
     assert (
@@ -326,8 +708,28 @@ def test_installable_zip_contains_the_exact_reviewed_sources():
             ).read_bytes()
 
 
-def test_ds_is_the_default_engine_for_docklens_figure_parity():
-    assert plugin._active_engine[0] == "ds"
+def test_plugin_copies_and_zip_bundle_are_synchronized():
+    root = Path(__file__).parents[1]
+    package = root / "pymol_interactions_plugin"
+    root_plugin = (root / "interactions_plugin.py").read_bytes()
+    packaged_plugin = (package / "interactions_plugin.py").read_bytes()
+
+    assert root_plugin == packaged_plugin
+    with zipfile.ZipFile(root / "pymol_interactions_plugin.zip") as archive:
+        assert archive.read(
+            "pymol_interactions_plugin/interactions_plugin.py"
+        ) == root_plugin
+        for module_name in (
+            "docklens_core.py",
+            "docklens_analysis_profiles.py",
+        ):
+            assert archive.read(
+                "pymol_interactions_plugin/" + module_name
+            ) == (package / module_name).read_bytes()
+
+
+def test_dsv_is_the_default_engine_for_docklens_figure_parity():
+    assert _canonical_profile_name(plugin._active_engine[0]) == "dsv"
 
 
 def test_ds_default_receptor_selection_includes_receptor_metals():
@@ -456,8 +858,8 @@ def test_ds_explicit_hbond_matches_docklens_three_geometry_filter():
     plugin.interactions_set_engine("ds")
     donor = _atom(1, "N", (0, 0, 0), "N", sybyl_type="N.am")
     hydrogen = _atom(2, "H", (1, 0, 0), "HN")
-    acceptor = _atom(3, "O", (3.9, 0, 0), "O", sybyl_type="O.2")
-    acceptor_base = _atom(4, "C", (3.9, 1, 0), "C", sybyl_type="C.2")
+    acceptor = _atom(3, "O", (3.3, 0, 0), "O", sybyl_type="O.2")
+    acceptor_base = _atom(4, "C", (3.3, 1, 0), "C", sybyl_type="C.2")
     _bond(donor, hydrogen)
     _bond(acceptor, acceptor_base, "2")
     donor_features = plugin.classify(
@@ -473,7 +875,7 @@ def test_ds_explicit_hbond_matches_docklens_three_geometry_filter():
     record = records[0]
     assert record["hydrogen"] == "LIG1_HN"
     assert record["chemistry_basis"] == "explicit_hydrogen"
-    assert record["hydrogen_acceptor_distance_A"] == pytest.approx(2.9)
+    assert record["hydrogen_acceptor_distance_A"] == pytest.approx(2.3)
     assert record["donor_hydrogen_acceptor_angle_deg"] == pytest.approx(180.0)
     assert record["hydrogen_acceptor_base_angle_deg"] == pytest.approx(90.0)
 
@@ -509,8 +911,8 @@ def test_ds_emits_one_auditable_hbond_record_per_qualifying_hydrogen():
     donor = _atom(1, "N", (0, 0, 0), "ND2", sybyl_type="N.am")
     hydrogen_1 = _atom(2, "H", (1, 0.1, 0), "HD21")
     hydrogen_2 = _atom(3, "H", (1, -0.1, 0), "HD22")
-    acceptor = _atom(4, "O", (3.5, 0, 0), "O", sybyl_type="O.2")
-    acceptor_base = _atom(5, "C", (3.5, 0, 1), "C", sybyl_type="C.2")
+    acceptor = _atom(4, "O", (3.3, 0, 0), "O", sybyl_type="O.2")
+    acceptor_base = _atom(5, "C", (3.3, 0, 1), "C", sybyl_type="C.2")
     _bond(donor, hydrogen_1)
     _bond(donor, hydrogen_2)
     _bond(acceptor, acceptor_base, "2")
@@ -972,8 +1374,10 @@ def test_pi_sigma_accepts_observed_hydrogen_centroid_distance():
 
 def test_pi_donor_accepts_observed_theta_limit():
     plugin.interactions_set_engine("ds")
-    donor = _atom(3, "N", (3.41, 0, 3.54), "N8")
-    hydrogen = _atom(4, "H", (2.7, 0, 2.81), "H18")
+    theta = np.deg2rad(44.0)
+    direction = (np.sin(theta), 0.0, np.cos(theta))
+    donor = _atom(3, "N", tuple(4.1 * value for value in direction), "N8")
+    hydrogen = _atom(4, "H", tuple(3.1 * value for value in direction), "H18")
     donor.neighbors = [hydrogen]
     feature = {"rings": [], "donors": [(donor, [hydrogen])]}
     result = plugin.detect_pi_donor_hbond({"rings": [_ring()], "donors": []}, feature)

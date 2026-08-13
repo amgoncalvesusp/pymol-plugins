@@ -2,9 +2,9 @@
 interaction_core.py — PyMOL-independent non-covalent interaction detection.
 
 The legacy PLIP branch is ported from the PyMOL plugin
-``interactions_plugin.py`` so historical results remain reproducible. The
-chemistry-aware strict branch adds explicit-hydrogen geometry and interaction
-types that are intentionally separate from the legacy behavior.
+``interactions_plugin.py`` so historical results remain reproducible. Native
+LUNA, DSV-like and conservative LUNA × DSV profiles add chemistry-aware
+geometry without changing the legacy contract.
 
   * ``Atom`` is built from plain fields (not a PyMOL chempy atom) and gains
     parser/UI bookkeeping fields (serial, subst_id, side).
@@ -43,6 +43,8 @@ INTERACTION_COLORS = {
     "hbond": ("skyblue", "Hydrogen bond (conventional)"),
     "carbon_hbond": ("bluishgreen", "Carbon H-bond (weak, C-H...O/N)"),
     "saltbridge": ("vermillion", "Salt bridge / ionic"),
+    "attractive_charge": ("orange", "Attractive charge interaction"),
+    "charge_repulsion": ("vermillion", "Repulsive charge interaction"),
     "pipi": ("reddishpurple", "pi-pi stacking (sandwich/T-shaped)"),
     "pication": ("yellow", "pi-cation"),
     "pialkyl": ("orange", "pi-alkyl"),
@@ -55,6 +57,7 @@ INTERACTION_COLORS = {
     "pi_anion": ("yellow", "pi-anion"),
     "pi_donor_hbond": ("bluishgreen", "pi-donor hydrogen bond"),
     "pi_lone_pair": ("skyblue", "Lone pair-pi"),
+    "chalcogen": ("black", "Chalcogen bond (S/Se/Te)"),
 }
 
 
@@ -70,10 +73,10 @@ def color_hex(itype: str) -> str:
 # ===========================================================================
 #
 # Sources:
-#   PLIP    = Salentin et al. 2015, PLIP config.py defaults.
-#   Steiner = Steiner, Angew. Chem. Int. Ed. 2002 (weak H-bonds).
-#   DS      = Discovery Studio interaction definitions (proprietary; ranges
-#             approximate, flagged UNCERTAIN).
+#   PLIP = Salentin et al. 2015 and the historical companion plug-in.
+#   LUNA = keiserlab/LUNA 0.14 ``luna/interaction/config.cfg``.
+#   DSV  = values queried from Discovery Studio Visualizer 2024
+#          ``Mdm::NonbondMonitor`` (24.1.0.23298).
 #
 CUTOFFS = {
     "hbond_dist": 4.1,
@@ -110,44 +113,222 @@ CUTOFFS = {
 
 _CUTOFF_DEFAULTS = dict(CUTOFFS)
 
-# ``plip`` preserves shipped behavior. ``dsv`` is an empirical calibration
-# against explicitly protonated Discovery Studio references, including a
-# matched 150-pose 2m5d corpus; it remains a beta scientific profile.
-HBOND_PRESETS = {
+# This public name is retained for project/manifest compatibility even though
+# each entry now configures the complete interaction detector, not only H-bonds.
+_PROFILE_OVERRIDES = {
     "plip": {
         "hbond_dist": _CUTOFF_DEFAULTS["hbond_dist"],
         "hbond_angle": _CUTOFF_DEFAULTS["hbond_angle"],
         "carbon_hbond_dist": _CUTOFF_DEFAULTS["carbon_hbond_dist"],
         "carbon_hbond_angle": _CUTOFF_DEFAULTS["carbon_hbond_angle"],
     },
-    "dsv": {
-        # Heavy-atom distance is only a broad prefilter. Explicit-H evidence
-        # is evaluated using the H...A distance plus DHA and HAY angles.
-        "hbond_dist": 4.1,
+    "luna": {
+        "hbond_dist": 3.9,
         "hbond_angle": 90.0,
-        "hbond_h_a_dist": 3.1,
+        "hbond_h_a_dist": 2.8,
         "hbond_acceptor_angle": 90.0,
-        "hbond_inferred_dist": 3.5,
-        "carbon_hbond_dist": 4.1,
-        "carbon_hbond_angle": 90.0,
+        "hbond_dar_angle": 90.0,
+        "hbond_h_a_required": 1.0,
+        "carbon_hbond_dist": 4.0,
+        "carbon_hbond_angle": 110.0,
         "carbon_hbond_h_a_dist": 3.0,
         "carbon_hbond_acceptor_angle": 90.0,
-        "carbon_hbond_inferred_dist": 3.5,
-        # The examples contain isolated hydrophobic contacts beyond 5 A, but
-        # widening these global thresholds sharply increases false positives
-        # over the matched 150-pose corpus. Keep the corpus-calibrated limits.
-        "pialkyl_dist": 4.9,
-        "alkyl_dist": 4.2,
+        "carbon_hbond_dar_angle": 90.0,
+        "carbon_hbond_h_a_required": 1.0,
+        "saltbridge_dist": 6.0,
+        "attractive_charge_dist": 6.0,
+        "repulsive_charge_dist": 6.0,
+        "pipi_dist": 6.0,
+        "pipi_stacked_theta_max": 30.0,
+        "pipi_t_theta_deviation_max": 30.0,
+        "pipi_slope_angle_min": 30.0,
+        "pipi_slope_angle_max": 60.0,
+        "pipi_offset_angle_min": 30.0,
+        "pipi_offset_angle_max": 60.0,
+        "pication_dist": 6.0,
+        "pialkyl_dist": 4.5,
+        "alkyl_dist": 4.5,
+        "halogen_dist": 4.0,
+        "halogen_ring_dist": 4.5,
+        "halogen_donor_angle_min": 120.0,
+        "halogen_acceptor_angle_min": 80.0,
+        "halogen_displacement_angle_max": 60.0,
+        "chalcogen_dist": 4.0,
+        "chalcogen_ring_dist": 4.5,
+        "chalcogen_donor_angle_min": 120.0,
+        "chalcogen_acceptor_angle_min": 80.0,
+        "chalcogen_displacement_angle_max": 60.0,
+        "pi_sulfur_dist": 4.5,
+        "metal_dist": 2.8,
+    },
+    "dsv": {
+        "hbond_dist": 3.4,
+        "hbond_angle": 90.0,
+        "hbond_acceptor_angle": 90.0,
+        "hbond_dar_angle": 90.0,
+        "hbond_h_a_required": 0.0,
+        "carbon_hbond_dist": 3.8,
+        "carbon_hbond_angle": 90.0,
+        "carbon_hbond_acceptor_angle": 90.0,
+        "carbon_hbond_dar_angle": 90.0,
+        "carbon_hbond_h_a_required": 0.0,
+        "saltbridge_dist": 4.0,
+        "charge_dist": 5.6,
+        "attractive_charge_dist": 5.6,
+        "repulsive_charge_dist": 5.6,
+        "pipi_dist": 6.0,
+        "pipi_closest_atom_dist": 4.5,
+        "pipi_stacked_theta_max": 50.0,
+        "pipi_stacked_gamma_max": 35.0,
+        "pipi_t_theta_deviation_max": 30.0,
+        "pipi_t_gamma_min": 55.0,
+        "pication_dist": 5.0,
+        "pication_angle_max": 40.0,
+        "pialkyl_dist": 5.5,
+        "alkyl_dist": 5.5,
+        "halogen_f_dist": 3.7,
+        "halogen_vdw_fraction": 1.0,
+        "halogen_donor_angle_min": 120.0,
+        "halogen_acceptor_angle_min": 75.0,
         "metal_dist": 3.0,
-        "pi_sulfur_dist": 5.3,
-        "pi_lone_pair_dist": 3.5,
-        "pi_lone_pair_angle": 30.0,
+        "pi_sigma_carbon_dist": 4.0,
+        "pi_sigma_axis_angle": 45.0,
+        "pi_sigma_dha_angle": 160.0,
+        "pi_sigma_use_h_centroid": 0.0,
+        "pi_donor_dist": 4.2,
+        "pi_donor_axis_angle": 45.0,
+        "pi_donor_dha_angle": 140.0,
+        "pi_donor_use_h_centroid": 0.0,
+        "pi_sulfur_edge_dist": 6.0,
+        "pi_sulfur_edge_angle_min": 70.0,
+        "pi_sulfur_face_dist": 4.5,
+        "pi_sulfur_face_angle_max": 25.0,
+        "pi_sulfur_dist": 6.0,
+        "pi_lone_pair_dist": 3.0,
+        "pi_lone_pair_angle": 45.0,
+        "chalcogen_vdw_fraction": 1.0,
+        "chalcogen_donor_angle_min": 90.0,
+        "chalcogen_acceptor_angle_min": 60.0,
     },
 }
 
 
+def _conservative_luna_dsv_overrides():
+    """Return the strict overlap plus the native-only criteria of each source."""
+    dsv = _PROFILE_OVERRIDES["dsv"]
+    luna = _PROFILE_OVERRIDES["luna"]
+    values = dict(dsv)
+    values.update(
+        {
+            "hbond_dist": min(dsv["hbond_dist"], luna["hbond_dist"]),
+            "hbond_h_a_dist": luna["hbond_h_a_dist"],
+            "hbond_h_a_required": 1.0,
+            "hbond_angle": max(dsv["hbond_angle"], luna["hbond_angle"]),
+            "hbond_acceptor_angle": max(
+                dsv["hbond_acceptor_angle"], luna["hbond_acceptor_angle"]
+            ),
+            "carbon_hbond_dist": min(
+                dsv["carbon_hbond_dist"], luna["carbon_hbond_dist"]
+            ),
+            "carbon_hbond_h_a_dist": luna["carbon_hbond_h_a_dist"],
+            "carbon_hbond_h_a_required": 1.0,
+            "carbon_hbond_angle": max(
+                dsv["carbon_hbond_angle"], luna["carbon_hbond_angle"]
+            ),
+            "carbon_hbond_acceptor_angle": max(
+                dsv["carbon_hbond_acceptor_angle"],
+                luna["carbon_hbond_acceptor_angle"],
+            ),
+            "saltbridge_dist": min(
+                dsv["saltbridge_dist"], luna["saltbridge_dist"]
+            ),
+            "attractive_charge_dist": min(
+                dsv["attractive_charge_dist"],
+                luna["attractive_charge_dist"],
+            ),
+            "repulsive_charge_dist": min(
+                dsv["repulsive_charge_dist"], luna["repulsive_charge_dist"]
+            ),
+            "pipi_dist": min(dsv["pipi_dist"], luna["pipi_dist"]),
+            "pipi_stacked_theta_max": min(
+                dsv["pipi_stacked_theta_max"],
+                luna["pipi_stacked_theta_max"],
+            ),
+            "pipi_stacked_gamma_max": 30.0,
+            "pipi_t_theta_deviation_max": min(
+                dsv["pipi_t_theta_deviation_max"],
+                luna["pipi_t_theta_deviation_max"],
+            ),
+            "pipi_t_gamma_min": 60.0,
+            "pication_dist": min(dsv["pication_dist"], luna["pication_dist"]),
+            "alkyl_dist": min(dsv["alkyl_dist"], luna["alkyl_dist"]),
+            "halogen_dist": luna["halogen_dist"],
+            "halogen_acceptor_angle_min": max(
+                dsv["halogen_acceptor_angle_min"],
+                luna["halogen_acceptor_angle_min"],
+            ),
+            "halogen_donor_angle_min": max(
+                dsv["halogen_donor_angle_min"],
+                luna["halogen_donor_angle_min"],
+            ),
+            "chalcogen_dist": luna["chalcogen_dist"],
+            "chalcogen_donor_angle_min": luna["chalcogen_donor_angle_min"],
+            "chalcogen_acceptor_angle_min": luna[
+                "chalcogen_acceptor_angle_min"
+            ],
+            "metal_dist": min(dsv["metal_dist"], luna["metal_dist"]),
+            "pi_sulfur_dist": min(
+                dsv["pi_sulfur_face_dist"], luna["pi_sulfur_dist"]
+            ),
+        }
+    )
+    return values
+
+
+_PROFILE_OVERRIDES["luna_dsv"] = _conservative_luna_dsv_overrides()
+HBOND_PRESETS = MappingProxyType(
+    {
+        name: MappingProxyType(dict(_PROFILE_OVERRIDES[name]))
+        for name in ("plip", "luna", "dsv", "luna_dsv")
+    }
+)
+
+_NEW_PROFILE_TYPES = {"attractive_charge", "charge_repulsion", "chalcogen"}
+_LEGACY_TYPES = tuple(
+    kind for kind in INTERACTION_COLORS if kind not in _NEW_PROFILE_TYPES
+)
+_PROFILE_DEFAULT_TYPES = MappingProxyType(
+    {
+        "plip": _LEGACY_TYPES,
+        "luna": (
+            "hbond",
+            "carbon_hbond",
+            "attractive_charge",
+            "charge_repulsion",
+            "pipi",
+            "pication",
+            "alkyl",
+            "halogen",
+            "metal",
+            "pi_sulfur",
+            "chalcogen",
+        ),
+        "dsv": tuple(INTERACTION_COLORS),
+        "luna_dsv": tuple(INTERACTION_COLORS),
+    }
+)
+
+
+def default_types_for_profile(name):
+    """Return the non-inflating default interaction families for a profile."""
+    normalized = str(name).strip().lower()
+    if normalized not in _PROFILE_DEFAULT_TYPES:
+        raise ValueError("Unknown chemistry profile: %s" % normalized)
+    return _PROFILE_DEFAULT_TYPES[normalized]
+
+
 def apply_hbond_preset(name):
-    """Reset globals and apply one named analysis profile in-place."""
+    """Reset globals and apply one named scientific profile in-place."""
     preset = HBOND_PRESETS.get(str(name).lower())
     if preset:
         CUTOFFS.clear()
@@ -156,9 +337,12 @@ def apply_hbond_preset(name):
 
 
 def cutoffs_for_preset(name):
-    """Return an immutable cutoff snapshot without mutating process globals."""
+    """Return an immutable profile snapshot without mutating process globals."""
+    normalized = str(name).strip().lower()
+    if normalized not in HBOND_PRESETS:
+        raise ValueError("Unknown chemistry profile: %s" % normalized)
     values = dict(_CUTOFF_DEFAULTS)
-    values.update(HBOND_PRESETS.get(str(name).lower(), HBOND_PRESETS["plip"]))
+    values.update(HBOND_PRESETS[normalized])
     return MappingProxyType(values)
 
 
@@ -393,11 +577,29 @@ _ANION_RES_ATOMS = {
     "ASP": ["OD1", "OD2"],
     "GLU": ["OE1", "OE2"],
 }
-_HALOGENS = {"Cl", "Br", "I"}
+_HALOGENS = {"F", "Cl", "Br", "I"}
+_CHALCOGENS = {"S", "Se", "Te"}
 _HB_ACCEPTOR_ELEMS = {"N", "O", "S", "F"}
 _HB_DONOR_ELEMS = {"N", "O"}
 _METALS = {"Na", "K", "Mg", "Ca", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Cd", "Hg"}
 _WATER_RESN = {"HOH", "WAT", "H2O", "SOL", "TIP", "TIP3", "TIP4", "SPC", "DOD"}
+
+# Bondi/commonly used van der Waals radii (angstrom). Only elements required by
+# the DSV halogen/sulfur criteria are included; unknowns use a conservative
+# 1.70 A fallback rather than silently bypassing the VDW-fraction criterion.
+_VDW_RADII = {
+    "C": 1.70,
+    "N": 1.55,
+    "O": 1.52,
+    "F": 1.47,
+    "P": 1.80,
+    "S": 1.80,
+    "Cl": 1.75,
+    "Se": 1.90,
+    "Br": 1.85,
+    "Te": 2.06,
+    "I": 1.98,
+}
 
 
 def _h_neighbors(atom):
@@ -604,7 +806,10 @@ def classify(atoms, rings, has_h, chemistry_profile="plip"):
     alkyl_carbons = []
     metals = []
     sulfurs = []
-    chemistry_aware = str(chemistry_profile).strip().lower() == "dsv"
+    chalcogens = []
+    profile = str(chemistry_profile).strip().lower()
+    chemistry_aware = profile != "plip"
+    requires_explicit_donor = profile in {"luna", "luna_dsv"}
     side_has_explicit_hydrogens = any(atom.elem == "H" for atom in atoms)
 
     # charged centres from formal charge
@@ -677,7 +882,10 @@ def classify(atoms, rings, has_h, chemistry_profile="plip"):
                 acceptors.append(a)
             if _chemistry_aware_donor(
                 a,
-                allow_inferred_hydrogen=not side_has_explicit_hydrogens,
+                allow_inferred_hydrogen=(
+                    not requires_explicit_donor
+                    and not side_has_explicit_hydrogens
+                ),
             ):
                 hs = _h_neighbors(a)
                 donors.append((a, hs))
@@ -719,6 +927,10 @@ def classify(atoms, rings, has_h, chemistry_profile="plip"):
             metals.append(a)
         if a.elem == "S":
             sulfurs.append(a)
+        if a.elem in _CHALCOGENS:
+            bonded = _heavy_neighbors(a)
+            if bonded:
+                chalcogens.append((a, bonded[0]))
 
     return {
         "donors": donors,
@@ -731,6 +943,7 @@ def classify(atoms, rings, has_h, chemistry_profile="plip"):
         "alkyl": alkyl_carbons,
         "metals": metals,
         "sulfurs": sulfurs,
+        "chalcogens": chalcogens,
         "rings": rings,
     }
 
@@ -779,7 +992,8 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
             d = _dist(donor.coord, acc.coord)
             if d > dist_cut:
                 continue
-            chemistry_aware = _ACTIVE_CHEMISTRY_PROFILE.get() == "dsv"
+            profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+            chemistry_aware = profile != "plip"
             if chemistry_aware and hs:
                 cutoffs = _active_cutoffs()
                 prefix = "hbond" if itype == "hbond" else "carbon_hbond"
@@ -790,7 +1004,10 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
                     continue
                 for hydrogen in hs:
                     hydrogen_distance = _dist(hydrogen.coord, acc.coord)
-                    if hydrogen_distance > cutoffs[f"{prefix}_h_a_dist"]:
+                    use_h_a = bool(cutoffs.get(f"{prefix}_h_a_required", 0.0))
+                    if use_h_a and hydrogen_distance > cutoffs[
+                        f"{prefix}_h_a_dist"
+                    ]:
                         continue
                     donor_angle = _angle_at(
                         hydrogen.coord,
@@ -808,6 +1025,18 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
                         for base in acceptor_bases
                     )
                     if acceptor_angle < cutoffs[f"{prefix}_acceptor_angle"]:
+                        continue
+                    donor_acceptor_base_angle = max(
+                        _angle_at(
+                            acc.coord,
+                            donor.coord,
+                            base.coord,
+                        )
+                        for base in acceptor_bases
+                    )
+                    if donor_acceptor_base_angle < cutoffs.get(
+                        f"{prefix}_dar_angle", 0.0
+                    ):
                         continue
                     out.append(
                         _mk(
@@ -827,12 +1056,12 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
                             hydrogen_acceptor_distance=hydrogen_distance,
                             donor_hydrogen_acceptor_angle=donor_angle,
                             hydrogen_acceptor_base_angle=acceptor_angle,
+                            donor_acceptor_base_angle=donor_acceptor_base_angle,
                         )
                     )
                 continue
             if chemistry_aware and not hs:
-                prefix = "hbond" if itype == "hbond" else "carbon_hbond"
-                if d > _active_cutoffs()[f"{prefix}_inferred_dist"]:
+                if profile in {"luna", "luna_dsv"}:
                     continue
             if not chemistry_aware and has_h and hs:
                 best = max(_angle_at(h.coord, donor.coord, acc.coord) for h in hs)
@@ -883,25 +1112,99 @@ def detect_carbon_hbond(fa, fb, has_h):
 def detect_saltbridge(fa, fb):
     cut = _active_cutoffs()["saltbridge_dist"]
     out = []
+    best_by_pair = {}
+    semantic_dedup = _ACTIVE_CHEMISTRY_PROFILE.get() != "plip"
     for cats, anis in ((fa["cations"], fb["anions"]), (fb["cations"], fa["anions"])):
         for cpt, clbl, catom in cats:
             for apt, albl, aatom in anis:
-                if _dist(cpt, apt) <= cut:
-                    out.append(
-                        _mk(
-                            "saltbridge",
-                            "",
-                            clbl,
-                            albl,
-                            cpt,
-                            apt,
-                            catom,
-                            aatom,
-                            "cation",
-                            "anion",
-                        )
-                    )
+                distance = _dist(cpt, apt)
+                if distance > cut:
+                    continue
+                record = _mk(
+                    "saltbridge",
+                    "",
+                    clbl,
+                    albl,
+                    cpt,
+                    apt,
+                    catom,
+                    aatom,
+                    "cation",
+                    "anion",
+                )
+                if not semantic_dedup:
+                    out.append(record)
+                    continue
+                key = (catom.res_tag(), aatom.res_tag())
+                previous = best_by_pair.get(key)
+                if previous is None or distance < previous[0]:
+                    best_by_pair[key] = (distance, record)
+    if semantic_dedup:
+        out.extend(item[1] for item in best_by_pair.values())
     return out
+
+
+def _deduplicated_charge_records(pairs, interaction_type, cutoff):
+    best_by_pair = {}
+    for centres_a, centres_b in pairs:
+        for point_a, label_a, atom_a in centres_a:
+            for point_b, label_b, atom_b in centres_b:
+                distance = _dist(point_a, point_b)
+                if distance > cutoff:
+                    continue
+                key = (atom_a.res_tag(), atom_b.res_tag())
+                record = _mk(
+                    interaction_type,
+                    "",
+                    label_a,
+                    label_b,
+                    point_a,
+                    point_b,
+                    atom_a,
+                    atom_b,
+                    "charge",
+                    "charge",
+                )
+                previous = best_by_pair.get(key)
+                if previous is None or distance < previous[0]:
+                    best_by_pair[key] = (distance, record)
+    return [item[1] for item in best_by_pair.values()]
+
+
+def detect_attractive_charge(fa, fb):
+    """Detect ionic attraction outside the profile's salt-bridge core."""
+    profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+    if profile == "plip":
+        return []
+    cutoffs = _active_cutoffs()
+    records = _deduplicated_charge_records(
+        ((fa["cations"], fb["anions"]), (fb["cations"], fa["anions"])),
+        "attractive_charge",
+        cutoffs["attractive_charge_dist"],
+    )
+    if profile != "plip":
+        salt_limit = cutoffs["saltbridge_dist"]
+        records = [
+            record
+            for record in records
+            if _dist(record["a_point"], record["b_point"]) > salt_limit
+        ]
+    return records
+
+
+def detect_charge_repulsion(fa, fb):
+    """Detect same-sign charge contacts exposed by both LUNA and DSV."""
+    if _ACTIVE_CHEMISTRY_PROFILE.get() == "plip":
+        return []
+    cutoffs = _active_cutoffs()
+    return _deduplicated_charge_records(
+        (
+            (fa["cations"], fb["cations"]),
+            (fa["anions"], fb["anions"]),
+        ),
+        "charge_repulsion",
+        cutoffs["repulsive_charge_dist"],
+    )
 
 
 def detect_pipi(fa, fb):
@@ -910,6 +1213,53 @@ def detect_pipi(fa, fb):
     for r1 in fa["rings"]:
         for r2 in fb["rings"]:
             if _dist(r1.centroid, r2.centroid) > c["pipi_dist"]:
+                continue
+            profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+            if profile != "plip":
+                closest = min(
+                    _dist(atom1.coord, atom2.coord)
+                    for atom1 in r1.atoms
+                    for atom2 in r2.atoms
+                )
+                closest_limit = c.get("pipi_closest_atom_dist")
+                if closest_limit is not None and closest > closest_limit:
+                    continue
+                theta = _plane_angle(r1.normal, r2.normal)
+                gamma = max(
+                    _axis_angle(r2.centroid, r1.centroid, r1.normal),
+                    _axis_angle(r1.centroid, r2.centroid, r2.normal),
+                )
+                stacked = theta <= c["pipi_stacked_theta_max"]
+                if "pipi_stacked_gamma_max" in c:
+                    stacked = stacked and gamma <= c["pipi_stacked_gamma_max"]
+                tshaped = (
+                    90.0 - theta <= c["pipi_t_theta_deviation_max"]
+                )
+                if "pipi_t_gamma_min" in c:
+                    tshaped = tshaped and gamma >= c["pipi_t_gamma_min"]
+                if stacked:
+                    subtype = "sandwich"
+                elif tshaped:
+                    subtype = "tshaped"
+                else:
+                    continue
+                out.append(
+                    _mk(
+                        "pipi",
+                        subtype,
+                        r1.tag,
+                        r2.tag,
+                        r1.centroid,
+                        r2.centroid,
+                        r1,
+                        r2,
+                        "ring",
+                        "ring",
+                        theta=theta,
+                        gamma=gamma,
+                        closest_atom_distance=closest,
+                    )
+                )
                 continue
             offset = min(
                 _proj_offset(r2.centroid, r1.centroid, r1.normal),
@@ -950,7 +1300,15 @@ def detect_pication(fa, fb):
             for cpt, clbl, catom in cats:
                 if _dist(r.centroid, cpt) > c["pication_dist"]:
                     continue
-                if _proj_offset(cpt, r.centroid, r.normal) > c["pication_offset"]:
+                profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+                if profile == "plip":
+                    if _proj_offset(cpt, r.centroid, r.normal) > c[
+                        "pication_offset"
+                    ]:
+                        continue
+                elif "pication_angle_max" in c and _axis_angle(
+                    cpt, r.centroid, r.normal
+                ) > c["pication_angle_max"]:
                     continue
                 out.append(
                     _mk(
@@ -973,14 +1331,14 @@ def detect_pialkyl(fa, fb):
     cut = _active_cutoffs()["pialkyl_dist"]
     out = []
     best_by_group = {}
-    dsv_profile = _ACTIVE_CHEMISTRY_PROFILE.get() == "dsv"
+    semantic_profile = _ACTIVE_CHEMISTRY_PROFILE.get() != "plip"
     for rings, alks in ((fa["rings"], fb["alkyl"]), (fb["rings"], fa["alkyl"])):
         for r in rings:
             for a in alks:
                 distance = _dist(r.centroid, a.coord)
                 if distance > cut:
                     continue
-                if dsv_profile and any(
+                if semantic_profile and any(
                     _pi_sigma_geometry(r, a, hydrogen) is not None
                     for hydrogen in _h_neighbors(a)
                 ):
@@ -997,7 +1355,7 @@ def detect_pialkyl(fa, fb):
                     "ring",
                     "alkyl",
                 )
-                if not dsv_profile:
+                if not semantic_profile:
                     out.append(record)
                     continue
                 # Use one closest contact per ring/residue pair for stable
@@ -1007,7 +1365,7 @@ def detect_pialkyl(fa, fb):
                 previous = best_by_group.get(group_key)
                 if previous is None or distance < previous[0]:
                     best_by_group[group_key] = (distance, record)
-    if dsv_profile:
+    if semantic_profile:
         out.extend(value[1] for value in best_by_group.values())
     return out
 
@@ -1030,7 +1388,9 @@ def _pi_sigma_geometry(ring, donor, hydrogen):
     donor_angle = _angle_at(hydrogen.coord, donor.coord, ring.centroid)
     if donor_distance > cutoffs["pi_sigma_carbon_dist"]:
         return None
-    if hydrogen_distance > cutoffs["pi_sigma_h_centroid_dist"]:
+    if bool(cutoffs.get("pi_sigma_use_h_centroid", 1.0)) and (
+        hydrogen_distance > cutoffs["pi_sigma_h_centroid_dist"]
+    ):
         return None
     if theta > cutoffs["pi_sigma_axis_angle"]:
         return None
@@ -1041,7 +1401,7 @@ def _pi_sigma_geometry(ring, donor, hydrogen):
 
 def detect_pi_sigma(fa, fb):
     """Detect an axial C-H sigma bond directed toward an aromatic ring."""
-    if _ACTIVE_CHEMISTRY_PROFILE.get() != "dsv":
+    if _ACTIVE_CHEMISTRY_PROFILE.get() not in {"dsv", "luna_dsv"}:
         return []
     best_by_pair = {}
     for rings, donors in (
@@ -1082,7 +1442,7 @@ def detect_pi_sigma(fa, fb):
 
 def detect_pi_donor_hbond(fa, fb):
     """Detect an N/O-H donor directed toward an aromatic pi system."""
-    if _ACTIVE_CHEMISTRY_PROFILE.get() != "dsv":
+    if _ACTIVE_CHEMISTRY_PROFILE.get() not in {"dsv", "luna_dsv"}:
         return []
     cutoffs = _active_cutoffs()
     best_by_pair = {}
@@ -1099,7 +1459,9 @@ def detect_pi_donor_hbond(fa, fb):
                     donor_angle = _angle_at(hydrogen.coord, donor.coord, ring.centroid)
                     if donor_distance > cutoffs["pi_donor_dist"]:
                         continue
-                    if hydrogen_distance > cutoffs["pi_donor_h_centroid_dist"]:
+                    if bool(cutoffs.get("pi_donor_use_h_centroid", 1.0)) and (
+                        hydrogen_distance > cutoffs["pi_donor_h_centroid_dist"]
+                    ):
                         continue
                     if theta > cutoffs["pi_donor_axis_angle"]:
                         continue
@@ -1133,13 +1495,14 @@ def detect_pi_donor_hbond(fa, fb):
 def detect_alkyl(fa, fb):
     cut = _active_cutoffs()["alkyl_dist"]
     out = []
+    best_by_pair = {}
+    semantic_dedup = _ACTIVE_CHEMISTRY_PROFILE.get() != "plip"
     for a in fa["alkyl"]:
         for b in fb["alkyl"]:
             distance = _dist(a.coord, b.coord)
             if distance > cut:
                 continue
-            out.append(
-                _mk(
+            record = _mk(
                     "alkyl",
                     "",
                     a.label(),
@@ -1151,7 +1514,15 @@ def detect_alkyl(fa, fb):
                     "alkyl",
                     "alkyl",
                 )
-            )
+            if not semantic_dedup:
+                out.append(record)
+                continue
+            key = (a.res_tag(), b.res_tag())
+            previous = best_by_pair.get(key)
+            if previous is None or distance < previous[0]:
+                best_by_pair[key] = (distance, record)
+    if semantic_dedup:
+        out.extend(item[1] for item in best_by_pair.values())
     return out
 
 
@@ -1164,10 +1535,42 @@ def detect_halogen(fa, fb):
     ):
         for x, cbonded in hals:
             for acc in accs:
-                if _dist(x.coord, acc.coord) > c["halogen_dist"]:
-                    continue
-                if _angle_at(x.coord, cbonded.coord, acc.coord) < c["halogen_angle"]:
-                    continue
+                distance = _dist(x.coord, acc.coord)
+                profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+                if profile == "plip":
+                    if distance > c["halogen_dist"]:
+                        continue
+                    if _angle_at(x.coord, cbonded.coord, acc.coord) < c[
+                        "halogen_angle"
+                    ]:
+                        continue
+                else:
+                    distance_limits = []
+                    if profile in {"luna", "luna_dsv"}:
+                        distance_limits.append(c["halogen_dist"])
+                    if profile in {"dsv", "luna_dsv"}:
+                        if x.elem == "F":
+                            distance_limits.append(c["halogen_f_dist"])
+                        else:
+                            vdw_limit = c["halogen_vdw_fraction"] * (
+                                _VDW_RADII.get(x.elem, 1.70)
+                                + _VDW_RADII.get(acc.elem, 1.70)
+                            )
+                            distance_limits.append(vdw_limit)
+                    if distance > min(distance_limits):
+                        continue
+                    donor_angle = _angle_at(x.coord, cbonded.coord, acc.coord)
+                    if donor_angle < c["halogen_donor_angle_min"]:
+                        continue
+                    bases = _heavy_neighbors(acc)
+                    if not bases:
+                        continue
+                    acceptor_angle = max(
+                        _angle_at(acc.coord, x.coord, base.coord)
+                        for base in bases
+                    )
+                    if acceptor_angle < c["halogen_acceptor_angle_min"]:
+                        continue
                 out.append(
                     _mk(
                         "halogen",
@@ -1213,19 +1616,53 @@ def detect_metal(fa, fb):
 
 
 def detect_pi_sulfur(fa, fb):
-    cut = _active_cutoffs()["pi_sulfur_dist"]
+    cutoffs = _active_cutoffs()
+    cut = cutoffs["pi_sulfur_dist"]
     out = []
-    dsv_profile = _ACTIVE_CHEMISTRY_PROFILE.get() == "dsv"
+    profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+    strict_aromatic = profile != "plip"
     for rings, sulfs in ((fa["rings"], fb["sulfurs"]), (fb["rings"], fa["sulfurs"])):
         for r in rings:
-            if dsv_profile and not _ring_has_aromatic_evidence(r):
+            if strict_aromatic and not _ring_has_aromatic_evidence(r):
                 continue
             for s in sulfs:
-                if _dist(r.centroid, s.coord) <= cut:
+                distance = _dist(r.centroid, s.coord)
+                subtype = ""
+                if profile in {"dsv", "luna_dsv"}:
+                    axis_angle = _axis_angle(s.coord, r.centroid, r.normal)
+                    face_limit = min(
+                        cut,
+                        cutoffs.get("pi_sulfur_face_dist", cut),
+                    )
+                    face = (
+                        distance <= face_limit
+                        and axis_angle
+                        <= cutoffs.get("pi_sulfur_face_angle_max", 25.0)
+                    )
+                    edge = (
+                        distance <= cut
+                        and axis_angle
+                        >= cutoffs.get("pi_sulfur_edge_angle_min", 70.0)
+                    )
+                    if face:
+                        subtype = "face-on"
+                    elif edge:
+                        subtype = "edge-on"
+                    else:
+                        continue
+                elif profile == "luna":
+                    if distance > cut or _axis_angle(
+                        s.coord, r.centroid, r.normal
+                    ) > cutoffs.get("chalcogen_displacement_angle_max", 60.0):
+                        continue
+                    subtype = "chalcogen-pi"
+                elif distance > cut:
+                    continue
+                if distance <= cut:
                     out.append(
                         _mk(
                             "pi_sulfur",
-                            "",
+                            subtype,
                             r.tag,
                             s.label(),
                             r.centroid,
@@ -1237,6 +1674,70 @@ def detect_pi_sulfur(fa, fb):
                         )
                     )
     return out
+
+
+def detect_chalcogen(fa, fb):
+    """Detect conservative R-Y...A-N chalcogen bonds (Y = S, Se or Te)."""
+    cutoffs = _active_cutoffs()
+    profile = _ACTIVE_CHEMISTRY_PROFILE.get()
+    if profile == "plip":
+        return []
+    best_by_pair = {}
+    for donors, acceptors in (
+        (fa["chalcogens"], fb["acceptors"]),
+        (fb["chalcogens"], fa["acceptors"]),
+    ):
+        for chalcogen, bonded in donors:
+            for acceptor in acceptors:
+                bases = _heavy_neighbors(acceptor)
+                if not bases:
+                    continue
+                distance = _dist(chalcogen.coord, acceptor.coord)
+                limits = []
+                if profile in {"luna", "luna_dsv"}:
+                    limits.append(cutoffs["chalcogen_dist"])
+                if profile in {"dsv", "luna_dsv"}:
+                    limits.append(
+                        cutoffs["chalcogen_vdw_fraction"]
+                        * (
+                            _VDW_RADII.get(chalcogen.elem, 1.80)
+                            + _VDW_RADII.get(acceptor.elem, 1.70)
+                        )
+                    )
+                if not limits or distance > min(limits):
+                    continue
+                donor_angle = _angle_at(
+                    chalcogen.coord,
+                    bonded.coord,
+                    acceptor.coord,
+                )
+                if donor_angle < cutoffs["chalcogen_donor_angle_min"]:
+                    continue
+                acceptor_angle = max(
+                    _angle_at(acceptor.coord, chalcogen.coord, base.coord)
+                    for base in bases
+                )
+                if acceptor_angle < cutoffs["chalcogen_acceptor_angle_min"]:
+                    continue
+                record = _mk(
+                    "chalcogen",
+                    chalcogen.elem,
+                    chalcogen.label(),
+                    acceptor.label(),
+                    chalcogen.coord,
+                    acceptor.coord,
+                    chalcogen,
+                    acceptor,
+                    "chalcogen_donor",
+                    "acceptor",
+                    donor_angle=donor_angle,
+                    acceptor_angle=acceptor_angle,
+                )
+                key = (chalcogen.res_tag(), acceptor.res_tag())
+                previous = best_by_pair.get(key)
+                if previous is None or distance < previous[0]:
+                    best_by_pair[key] = (distance, record)
+    return [item[1] for item in best_by_pair.values()]
 
 
 def detect_pi_anion(fa, fb):
@@ -1268,7 +1769,7 @@ def detect_pi_anion(fa, fb):
 
 def detect_pi_lone_pair(fa, fb):
     """Detect a lone-pair atom aligned over the face of an aromatic ring."""
-    if _ACTIVE_CHEMISTRY_PROFILE.get() != "dsv":
+    if _ACTIVE_CHEMISTRY_PROFILE.get() not in {"dsv", "luna_dsv"}:
         return []
     cutoffs = _active_cutoffs()
     out = []
@@ -1372,6 +1873,8 @@ DETECTORS = {
     "hbond": lambda fa, fb, h: detect_hbond(fa, fb, h),
     "carbon_hbond": lambda fa, fb, h: detect_carbon_hbond(fa, fb, h),
     "saltbridge": lambda fa, fb, h: detect_saltbridge(fa, fb),
+    "attractive_charge": lambda fa, fb, h: detect_attractive_charge(fa, fb),
+    "charge_repulsion": lambda fa, fb, h: detect_charge_repulsion(fa, fb),
     "pipi": lambda fa, fb, h: detect_pipi(fa, fb),
     "pication": lambda fa, fb, h: detect_pication(fa, fb),
     "pialkyl": lambda fa, fb, h: detect_pialkyl(fa, fb),
@@ -1383,6 +1886,7 @@ DETECTORS = {
     "pi_anion": lambda fa, fb, h: detect_pi_anion(fa, fb),
     "pi_donor_hbond": lambda fa, fb, h: detect_pi_donor_hbond(fa, fb),
     "pi_lone_pair": lambda fa, fb, h: detect_pi_lone_pair(fa, fb),
+    "chalcogen": lambda fa, fb, h: detect_chalcogen(fa, fb),
     # water_bridge handled separately (needs the water list)
 }
 
@@ -1435,11 +1939,16 @@ def compute_interactions(
     chemistry_token = _ACTIVE_CHEMISTRY_PROFILE.set(chemistry_profile)
     try:
         waters = waters or []
-        req = list(types) if types else list(VALID_TYPES)
-        # Preserve one coherent policy for the whole complex. If any explicit
-        # hydrogens are present, only donors with bonded H atoms are eligible
-        # and angular geometry is required on both sides. If none are present,
-        # the documented heavy-atom distance fallback applies to both sides.
+        req = (
+            list(types)
+            if types
+            else list(default_types_for_profile(chemistry_profile))
+        )
+        # ``has_h`` preserves the legacy PLIP behavior and controls explicit
+        # carbon-donor geometry. Chemistry-aware donor fallback is deliberately
+        # assessed per molecular side: DSV may infer donors on a hydrogen-free
+        # partner without discarding explicit geometry on the protonated side,
+        # while LUNA and the conservative hybrid always require bonded H atoms.
         has_h = any(a.elem == "H" for a in (*receptor_atoms, *ligand_atoms))
 
         feat_r = classify(
