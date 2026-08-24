@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+structlens-pymol/dist/*.zip
+structlens-pymol/dist/*.sha256
 
 # Tooling caches
 .ruff_cache/

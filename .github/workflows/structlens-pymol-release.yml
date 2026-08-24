@@ -1,0 +1,37 @@
+name: Release StructLens-PyMOL
+
+on:
+  push:
+    tags:
+      - "structlens-pymol-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run plugin tests
+        working-directory: structlens-pymol
+        run: |
+          python -m pip install --upgrade pytest
+          PYTHONPATH=. pytest -q
+      - name: Build release ZIP
+        working-directory: structlens-pymol
+        run: python scripts/build_release_zip.py --version "${GITHUB_REF_NAME#structlens-pymol-v}"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#structlens-pymol-v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "structlens-pymol/dist/StructLens-PyMOL-v${version}.zip" \
+            "structlens-pymol/dist/StructLens-PyMOL-v${version}.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "StructLens-PyMOL v${version}" \
+            --generate-notes
