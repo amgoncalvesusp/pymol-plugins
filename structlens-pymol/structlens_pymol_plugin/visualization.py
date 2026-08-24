@@ -76,6 +76,74 @@ class PyMOLVisualization:
             selections[category] = name
         return selections
 
+    def create_interaction_selections(self) -> dict[str, str]:
+        """Create conserved/gained/lost selections from stored geometry only."""
+        payload = self.reader.interactions()
+        records = payload.get("differences", payload.get("interaction_differences", []))
+        output: dict[str, str] = {}
+        for change in ("conserved", "gained", "lost"):
+            name = selection_name(self.analysis_id, self.active_target or "target", f"interactions_{change}")
+            expressions: list[str] = []
+            for item in records if isinstance(records, list) else []:
+                if item.get("change") != change:
+                    continue
+                record = item.get("target_record") if change != "lost" else item.get("reference_record")
+                if not isinstance(record, dict):
+                    continue
+                for field in ("residue_a", "residue_b"):
+                    residue = record.get(field)
+                    if isinstance(residue, dict):
+                        expressions.append(_pymol_locator(residue))
+            expression = " or ".join(dict.fromkeys(expressions)) or "none"
+            if hasattr(self.cmd, "select"):
+                self.cmd.select(name, expression)
+            self.created_selections.append(name)
+            output[change] = name
+        return output
+
+    def create_site_selections(self, site_id: str) -> dict[str, str]:
+        payload = self.reader.sites()
+        site = payload.get(site_id, payload.get("sites", {}).get(site_id, {})) if isinstance(payload, dict) else {}
+        output: dict[str, str] = {}
+        for label, structure_id in (("reference", self.reader.reference_id), ("target", self.active_target)):
+            name = selection_name(self.analysis_id, self.active_target or "target", f"site_{site_id}_{label}")
+            residues = site.get(label, site.get(f"{label}_residues", [])) if isinstance(site, dict) else []
+            expressions = [_pymol_locator(item) for item in residues if isinstance(item, dict)]
+            if hasattr(self.cmd, "select"):
+                self.cmd.select(name, " or ".join(expressions) or "none")
+            self.created_selections.append(name)
+            output[label] = name
+        return output
+
+    def draw_displacement_vectors(self, *, minimum_magnitude: float = 0.5, top_n: int = 100) -> str:
+        """Draw bundle-provided arrows; no transform or magnitude is recomputed."""
+        payload = self.reader.vectors()
+        vectors = payload.get("vectors", payload if isinstance(payload, list) else [])
+        selected = [item for item in vectors if isinstance(item, dict) and float(item.get("magnitude_angstrom", 0.0)) >= minimum_magnitude]
+        selected.sort(key=lambda item: (-float(item.get("magnitude_angstrom", 0.0)), str(item.get("reference_position", ""))))
+        selected = selected[:top_n]
+        object_name = selection_name(self.analysis_id, self.active_target or "target", "displacement_vectors")
+        if hasattr(self.cmd, "load_cgo"):
+            primitives: list[float] = []
+            for item in selected:
+                start = item.get("start_xyz")
+                end = item.get("end_xyz")
+                if not isinstance(start, list | tuple) or not isinstance(end, list | tuple) or len(start) != 3 or len(end) != 3:
+                    continue
+                primitives.extend([0.0, float(start[0]), float(start[1]), float(start[2]), float(end[0]), float(end[1]), float(end[2]), 0.08])
+            self.cmd.load_cgo(primitives, object_name)
+            self.created_objects.append(object_name)
+        return object_name
+
+    def evidence_card(self, reference_position: str, target_id: str | None = None) -> dict[str, Any] | None:
+        """Return the stored evidence card; this method never calculates science."""
+        payload = self.reader.evidence()
+        cards = payload.get("cards", payload if isinstance(payload, list) else [])
+        for card in cards if isinstance(cards, list) else []:
+            if card.get("reference_position") == reference_position and (target_id is None or card.get("target_id") == target_id):
+                return dict(card)
+        return None
+
     def set_active_target(self, target_id: str) -> None:
         if target_id not in self.reader.target_ids:
             raise KeyError(target_id)

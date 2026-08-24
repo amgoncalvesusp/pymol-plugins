@@ -76,3 +76,28 @@ class BundleReader:
 
     def transforms(self) -> dict[str, Any]:
         return dict(self.read_json("transforms/transforms.json"))
+
+    def optional_json(self, entry: str, default: Any = None) -> Any:
+        """Read an optional v0.3 result file without inventing values."""
+        try:
+            return self.read_json(entry)
+        except KeyError:
+            return default
+
+    def msa_summary(self) -> dict[str, Any]:
+        return dict(self.optional_json("analysis/msa_summary.json", {}) or {})
+
+    def conservation(self) -> dict[str, Any]:
+        return dict(self.optional_json("analysis/conservation.json", {}) or {})
+
+    def interactions(self) -> dict[str, Any]:
+        return dict(self.optional_json("analysis/interactions.json", {}) or {})
+
+    def sites(self) -> dict[str, Any]:
+        return dict(self.optional_json("analysis/sites.json", {}) or {})
+
+    def evidence(self) -> dict[str, Any]:
+        return dict(self.optional_json("analysis/evidence.json", {}) or {})
+
+    def vectors(self) -> dict[str, Any]:
+        return dict(self.optional_json("visualization/vectors.json", {}) or {})
