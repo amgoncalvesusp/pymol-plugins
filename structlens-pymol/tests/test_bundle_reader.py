@@ -51,3 +51,12 @@ def test_reader_rejects_traversal(tmp_path):
     _write(path, _manifest(), ("../../evil.py", "x"))
     with pytest.raises(UnsafeBundleError):
         BundleReader(path)
+
+
+def test_reader_exposes_optional_v03_sections_without_recalculation(tmp_path):
+    path = tmp_path / "v03.structlens-pymol"
+    _write(path, _manifest(), ("analysis/evidence.json", json.dumps({"cards": [{"reference_position": "A:10"}]})))
+    with BundleReader(path) as reader:
+        assert reader.evidence()["cards"][0]["reference_position"] == "A:10"
+        assert reader.interactions() == {}
+        assert reader.vectors() == {}

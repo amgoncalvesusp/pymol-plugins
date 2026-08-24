@@ -28,6 +28,16 @@ Overview, Mutation Focus, Key Residues, Mutated Key Residues, Structural
 Deviation, Outliers, and Publication presets. Target-specific scientific
 values remain the values recorded by StructLens.
 
-Tested contract: bundle schema `1.x`; plugin `0.1.0`. PyMOL versions should be
+Tested contract: bundle schema `1.x`; plugin `0.3.0`. PyMOL versions should be
 verified on the release page. If the plugin is unavailable, export remains a
 portable data bundle that can be inspected and re-imported after installation.
+
+## v0.3 scientific views
+
+The plugin reads (without recalculating) optional `analysis/msa_summary.json`,
+`analysis/conservation.json`, `analysis/interactions.json`,
+`analysis/sites.json`, `analysis/evidence.json`, and
+`visualization/vectors.json` files. It exposes residue evidence, conserved /
+gained / lost interaction selections, reference and target site selections,
+and displacement arrows from the coordinates recorded by StructLens. Lost
+interactions use reference geometry; gained interactions use target geometry.
