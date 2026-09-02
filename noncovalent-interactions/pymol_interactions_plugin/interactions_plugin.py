@@ -28,6 +28,10 @@ COMMANDS
   detect_interactions      detect + draw for one state (main command)
   interactions_set_engine  select plip, luna, dsv (default), or luna_dsv
                            ('ds' remains a compatibility alias for dsv)
+  interactions_set_analysis_profile  reporting view: complete (default)
+                           or ds_like (DockLens' Discovery Studio filter)
+  interactions_best_angle  orient the camera to the clearest view of the
+                           ligand-protein interaction network
   interactions_occupancy   persistence (%) of each interaction over an MD
                            trajectory: loops states, prints/CSV a ranked table
   interactions_export_csv  dump one state's interactions to a CSV file
@@ -106,9 +110,10 @@ def _bundled_path(filename):
     if module_file and os.path.isabs(module_file):
         candidates.append(os.path.dirname(module_file))
     for base in candidates:
-        path = os.path.join(base, "pymol_interactions_plugin", filename)
-        if os.path.isfile(path):
-            return path
+        for holder in ("pymol_interactions_plugin", ""):
+            path = os.path.join(base, holder, filename)
+            if os.path.isfile(path):
+                return path
     raise ImportError(
         "Could not locate bundled %s. Install pymol_interactions_plugin.zip "
         "with PyMOL Plugin Manager." % filename
@@ -116,8 +121,17 @@ def _bundled_path(filename):
 
 
 def _verify_reviewed_source(path, expected_sha256):
+    """Hash the reviewed source with line endings normalised to LF.
+
+    A Git checkout on Windows rewrites LF to CRLF, which changes the raw
+    byte digest without changing one character of reviewed code. Hashing
+    the normalised bytes keeps the integrity guarantee content-based and
+    matches _module_source_sha256 (which already normalised), instead of
+    failing the import -- and with it every detection -- on Windows.
+    """
     with open(path, "rb") as source_file:
-        actual = hashlib.sha256(source_file.read()).hexdigest()
+        normalised = source_file.read().replace(b"\r\n", b"\n")
+    actual = hashlib.sha256(normalised).hexdigest()
     if actual != expected_sha256:
         raise ImportError(
             "Bundled DockLens module failed integrity verification: %s" % path
@@ -161,7 +175,7 @@ except (ImportError, ValueError):
 
 
 DSV_PARITY_CONTRACT = "docklens-scientific-profiles-2026.08"
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.7.0"
 
 
 def _module_source_sha256(module):
@@ -303,6 +317,14 @@ DETECTION_ENGINES = list(_CANONICAL_PROFILES)
 # directly, immediately sees the change).
 CUTOFFS = dict(CUTOFF_PROFILES["dsv"])
 _active_engine = ["dsv"]
+# DockLens' second mode axis: 'complete' keeps every detected record,
+# 'ds_like' applies DockLens' Discovery Studio reporting filter.
+ANALYSIS_PROFILES = tuple(_docklens_analysis_profiles.VALID_ANALYSIS_PROFILES)
+_active_analysis_profile = ["complete"]
+# Endpoint geometry + selections of the most recent detection, used by
+# interactions_best_angle.
+_last_interaction_points = []
+_last_detection_context = {}
 _last_parity_diagnostics = []
 _parity_customized = [False]
 _parity_source_integrity = [_parity_sources_are_reviewed()]
@@ -329,12 +351,18 @@ def _parity_is_active():
 
 
 def _estimate_compute_cost(n_receptor, n_ligand, n_waters, include_water):
+    """Estimate the real work of one frame.
+
+    Water bridging screens every water against the receptor and ligand
+    partner lists once (linear), then pairs only the few partners left
+    inside the 2.5-4.1 A shell. It never repeats the receptor x ligand
+    product per water, so costing it that way rejected ordinary solvated
+    pockets and returned no interactions at all.
+    """
     atom_pairs = n_receptor * n_ligand
     if not include_water:
         return atom_pairs
-    return atom_pairs + n_waters * (
-        n_receptor + n_ligand + atom_pairs
-    )
+    return atom_pairs + n_waters * (n_receptor + n_ligand)
 
 
 # Pristine copy of the *active engine's* defaults (for the GUI "Reset" in the
@@ -1952,6 +1980,8 @@ def _compute_interactions(sel1, sel2, req_types, state):
         chemistry_profile=chemistry_profile,
     )
     inters = [_adapt_docklens_record(record) for record in raw_interactions]
+    if _active_analysis_profile[0] == "ds_like":
+        inters = [record for record in inters if _matches_ds_like(record)]
     if chemistry_profile != "plip":
         diagnostics = []
         all_atoms = atoms1 + atoms2
@@ -2008,12 +2038,14 @@ def detect_interactions(
     if has_h is None:
         print("[interactions] empty selection (sel1 or sel2 has no atoms).")
         return
+    dropped = 0
     if len(inters) > MAX_DRAWN_INTERACTIONS:
-        raise ValueError(
-            "Analysis found %d interactions; drawing is limited to %d. "
-            "Narrow the selections or export CSV instead."
-            % (len(inters), MAX_DRAWN_INTERACTIONS)
-        )
+        # Draw the closest contacts instead of refusing the whole run: a
+        # busy pocket must still show its interactions.
+        dropped = len(inters) - MAX_DRAWN_INTERACTIONS
+        inters = sorted(
+            inters, key=lambda record: record.get("dist") or 0.0
+        )[:MAX_DRAWN_INTERACTIONS]
 
     # Fresh slate for this group + helper (idempotent re-run / per-frame redraw).
     cmd.delete(group_name)
@@ -2028,11 +2060,18 @@ def detect_interactions(
 
     counts = {}
     res_seles = set()
+    _last_interaction_points[:] = []
     for inter in inters:
         _draw(inter, group_name, keep_label)
         counts[inter["type"]] = counts.get(inter["type"], 0) + 1
         res_seles.add(inter["a_sele"])
         res_seles.add(inter["b_sele"])
+        _last_interaction_points.append(
+            (_v(inter["a_point"]), _v(inter["b_point"]))
+        )
+    _last_detection_context.update(
+        {"sel1": sel1, "sel2": sel2, "group_name": group_name}
+    )
 
     cmd.disable(_HELPER)  # keep endpoint pseudoatoms hidden
 
@@ -2044,6 +2083,12 @@ def detect_interactions(
         "[interactions] state %d: %d interaction(s) drawn in group '%s'"
         % (state, total, group_name)
     )
+    if dropped:
+        print(
+            "    note: %d further interaction(s) beyond the %d drawing "
+            "limit were omitted (closest kept); export CSV for the full set."
+            % (dropped, MAX_DRAWN_INTERACTIONS)
+        )
     for itype in req_types:
         if counts.get(itype):
             print("    %-13s %d" % (itype, counts[itype]))
@@ -2272,7 +2317,7 @@ def interactions_export_csv(
             [
                 state,
                 _chemistry_profile_for_engine(),
-                "native",
+                _active_analysis_profile[0],
                 DSV_PARITY_CONTRACT,
                 _parity_is_active(),
                 interaction["type"],
@@ -2357,7 +2402,11 @@ def interactions_figure_preset(ray=0, filename=""):
     cmd.set("antialias", 2)
     cmd.set("dash_round_ends", 1)
     cmd.set("cartoon_transparency", 0.3)
-    cmd.orient("interactions_residues or interactions")
+    group = _last_detection_context.get("group_name", "interactions")
+    for target in ("%s_residues" % group, group, "organic"):
+        if _apply_optional_style("orient on %s" % target,
+                                 lambda t=target: cmd.orient(t)):
+            break
     if int(ray):
         cmd.ray(1600, 1200)
     if filename:
@@ -2489,6 +2538,30 @@ def _validate_appearance_int(value, name, lower, upper, allow_none=False):
     return int(parsed)
 
 
+def _style_target_exists(target):
+    """True when a PyMOL object or named selection currently has atoms."""
+    try:
+        return cmd.count_atoms(target) > 0
+    except Exception:
+        return False
+
+
+def _apply_optional_style(description, action):
+    """Run one styling call, tolerating targets that do not exist yet.
+
+    The interacting-residue selection only appears after a detection run,
+    so styling it must never abort the rest of the appearance pass.
+    """
+    try:
+        action()
+        return True
+    except Exception as exc:
+        print(
+            "[interactions] appearance: skipped %s (%s)" % (description, exc)
+        )
+        return False
+
+
 def interactions_set_appearance(
     thickness=0.06,
     dash_scale=1.0,
@@ -2595,14 +2668,26 @@ def interactions_set_appearance(
         cmd.color(protein_color, protein_selection)
     if ligand_color is not None:
         cmd.color(ligand_color, ligand_selection)
+    # <group>_residues exists only after a detection run with
+    # show_residues=1. Styling it unconditionally raised and aborted the
+    # whole call, which is why the GUI Detect button could die before it
+    # detected anything.
     if interacting_residue_color is not None:
-        cmd.color(interacting_residue_color, residue_selection)
+        _apply_optional_style(
+            "interacting-residue colour",
+            lambda: cmd.color(interacting_residue_color, residue_selection),
+        )
     if stick_radius is not None:
         cmd.set("stick_radius", stick_radius, molecule_selection)
-        cmd.set("stick_radius", stick_radius, residue_selection)
+        _apply_optional_style(
+            "interacting-residue stick radius",
+            lambda: cmd.set("stick_radius", stick_radius, residue_selection),
+        )
     if sphere_size is not None:
-        cmd.set("sphere_scale", sphere_size, "nb_spheres")
-        cmd.set("nonbonded_size", sphere_size, "nonbonded")
+        # Nonbonded/sphere sizes are per-selection settings; the previous
+        # representation names were not selectable objects.
+        cmd.set("sphere_scale", sphere_size, molecule_selection)
+        cmd.set("nonbonded_size", sphere_size, molecule_selection)
 
     n = 0
     for name in list(_dash_base):
@@ -2700,6 +2785,169 @@ def interactions_set_engine(engine="dsv"):
     print("[interactions] scientific profile set to '%s'." % engine)
 
 
+def interactions_set_analysis_profile(profile="complete"):
+    """Select DockLens' reporting view for the detected records.
+
+    complete  keep every record the scientific profile detects (default)
+    ds_like   apply DockLens' Discovery Studio reporting filter, which
+              keeps the DS-reported families and drops salt bridges longer
+              than DockLens' DS distance ceiling.
+
+    The chemistry profile (interactions_set_engine) and this reporting view
+    are independent axes, so every DockLens mode combination is reachable.
+    """
+    requested = str(profile).strip().lower()
+    try:
+        normalized = _docklens_analysis_profiles.normalize_analysis_profile(
+            requested
+        )
+    except ValueError:
+        print(
+            "[interactions] unknown analysis profile '%s'. Valid: %s"
+            % (requested, ", ".join(ANALYSIS_PROFILES))
+        )
+        return None
+    _active_analysis_profile[0] = normalized
+    print("[interactions] analysis profile set to '%s'." % normalized)
+    return normalized
+
+
+def _selection_centre(selection):
+    """Bounding-box centre of a selection, or None when it has no atoms."""
+    try:
+        (x0, y0, z0), (x1, y1, z1) = cmd.get_extent(selection)
+    except Exception:
+        return None
+    return np.array(
+        [(x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0], dtype=float
+    )
+
+
+def _best_view_axes(points):
+    """Camera axes that lay the interaction network flat on the screen.
+
+    Principal-component analysis of the interaction endpoint cloud: the two
+    directions of largest spread span the screen plane and the direction of
+    least spread becomes the viewing axis. Looking down the thinnest
+    direction is what minimises dashes overlapping one another on screen.
+
+    Returns (axes, centre, planarity) where the axes rows are the camera
+    right, up and viewing axes, and planarity is the fraction of the
+    cloud's variance captured by the screen plane (1.0 = planar network).
+    """
+    cloud = np.asarray(points, dtype=float)
+    if cloud.ndim != 2 or cloud.shape[0] < 2:
+        return None, None, 0.0
+    centre = cloud.mean(axis=0)
+    centred = cloud - centre
+    if not np.any(np.abs(centred) > 1e-9):
+        return None, centre, 0.0
+    _u, singular, vh = np.linalg.svd(centred, full_matrices=True)
+    right = vh[0] / np.linalg.norm(vh[0])
+    view_axis = vh[2] / np.linalg.norm(vh[2])
+    up = np.cross(view_axis, right)
+    up_norm = np.linalg.norm(up)
+    if up_norm < 1e-9:
+        return None, centre, 0.0
+    up = up / up_norm
+    # Rebuild 'right' from the other two so the frame stays right-handed.
+    right = np.cross(up, view_axis)
+    variances = np.asarray(singular, dtype=float) ** 2
+    if variances.size < 3 or variances.sum() <= 0.0:
+        planarity = 1.0
+    else:
+        planarity = float((variances[0] + variances[1]) / variances.sum())
+    return np.array([right, up, view_axis]), centre, planarity
+
+
+def interactions_best_angle(
+    group_name="interactions",
+    buffer=2.0,
+    zoom_selection="",
+    apply=1,
+):
+    """Orient the camera to the clearest view of the drawn interactions.
+
+    Run detect_interactions first: this uses that run's endpoint geometry.
+    The camera looks down the thinnest direction of the interaction network,
+    so the dashes spread across the screen instead of stacking behind one
+    another, and the ligand is kept in front of the receptor.
+
+    buffer          zoom padding in Angstrom.
+    zoom_selection  what to frame (default: ligand plus the interacting
+                    residues of the last run).
+    apply           0 => only report the computed view, do not move the
+                    camera.
+    """
+    if not _last_interaction_points:
+        print(
+            "[interactions] no interactions in memory; run "
+            "detect_interactions first."
+        )
+        return None
+    points = []
+    for a_point, b_point in _last_interaction_points:
+        points.append(a_point)
+        points.append(b_point)
+    axes, centre, planarity = _best_view_axes(points)
+    if axes is None:
+        print(
+            "[interactions] interaction geometry is degenerate; "
+            "keeping the current view."
+        )
+        return None
+
+    sel1 = _last_detection_context.get("sel1", "polymer")
+    sel2 = _last_detection_context.get("sel2", "organic")
+    ligand_centre = _selection_centre(sel2)
+    receptor_centre = _selection_centre(sel1)
+    if ligand_centre is not None and receptor_centre is not None:
+        # The third row points from the scene towards the camera, so keep
+        # the ligand on the camera side of the receptor.
+        if float(np.dot(ligand_centre - receptor_centre, axes[2])) < 0.0:
+            axes = np.array([-axes[0], axes[1], -axes[2]])
+
+    result = {
+        "right": tuple(float(value) for value in axes[0]),
+        "up": tuple(float(value) for value in axes[1]),
+        "view_axis": tuple(float(value) for value in axes[2]),
+        "centre": tuple(float(value) for value in centre),
+        "planarity": planarity,
+    }
+    if not int(apply):
+        return result
+
+    view = list(cmd.get_view())
+    view[0:9] = [float(value) for row in axes for value in row]
+    view[12:15] = [float(value) for value in centre]
+    cmd.set_view(view)
+
+    group_name = _validate_group_name(
+        group_name or _last_detection_context.get("group_name", "interactions")
+    )
+    target = str(zoom_selection or "").strip()
+    if not target:
+        residues = "%s_residues" % group_name
+        if _style_target_exists(residues):
+            target = "(%s) or (%s)" % (sel2, residues)
+        else:
+            target = sel2
+    try:
+        cmd.zoom(target, float(buffer))
+    except Exception as exc:
+        print(
+            "[interactions] best angle: could not zoom %s (%s)"
+            % (target, exc)
+        )
+
+    print(
+        "[interactions] best angle applied from %d interaction endpoint(s); "
+        "network planarity %.2f (1.00 = all interactions in one plane)."
+        % (len(points), planarity)
+    )
+    return result
+
+
 def interactions_set_cutoff(key, value):
     """Set a single geometric cutoff at runtime (see the CUTOFFS table).
 
@@ -2741,7 +2989,7 @@ def interactions_parity_status():
         "active": active,
         "engine": _active_engine[0],
         "profile": _chemistry_profile_for_engine(),
-        "analysis_profile": "native",
+        "analysis_profile": _active_analysis_profile[0],
         "plugin_version": PLUGIN_VERSION,
         "contract": DSV_PARITY_CONTRACT,
         "customized": _parity_customized[0],
@@ -2888,6 +3136,13 @@ def run_plugin_gui():
         profile_combo.addItems(["plip", "luna", "dsv", "luna_dsv"])
         profile_combo.setCurrentText(_active_engine[0])
         form.addRow("Scientific profile:", profile_combo)
+        analysis_combo = QtWidgets.QComboBox()
+        analysis_combo.addItems(list(ANALYSIS_PROFILES))
+        analysis_combo.setCurrentText(_active_analysis_profile[0])
+        form.addRow("Analysis view:", analysis_combo)
+        analysis_combo.currentTextChanged.connect(
+            lambda value: interactions_set_analysis_profile(str(value))
+        )
         parity_label = QtWidgets.QLabel()
         parity_label.setWordWrap(True)
 
@@ -3049,10 +3304,12 @@ def run_plugin_gui():
         btns3 = QtWidgets.QHBoxLayout()
         b_legend = QtWidgets.QPushButton("Legend")
         b_fig = QtWidgets.QPushButton("Figure preset")
+        b_angle = QtWidgets.QPushButton("Best angle")
         b_adv = QtWidgets.QPushButton("Edit cutoffs...")
         b_close = QtWidgets.QPushButton("Close")
         btns3.addWidget(b_legend)
         btns3.addWidget(b_fig)
+        btns3.addWidget(b_angle)
         btns3.addWidget(b_adv)
         btns3.addWidget(b_close)
         form.addRow(btns3)
@@ -3100,8 +3357,8 @@ def run_plugin_gui():
             chosen = _chosen()
             if not chosen:
                 return
-            if not _apply_appearance():
-                return
+            # Detection first: appearance is cosmetic and must never be
+            # able to stop the analysis from running.
             s1, s2 = _sels()
             counts = detect_interactions(
                 s1,
@@ -3163,6 +3420,18 @@ def run_plugin_gui():
         )
         b_legend.clicked.connect(lambda: show_interaction_legend(onscreen=0))
         b_fig.clicked.connect(lambda: interactions_figure_preset())
+
+        def _run_best_angle():
+            result = interactions_best_angle()
+            if result is None:
+                summary.setText("Best angle needs a detection run first.")
+            else:
+                summary.setText(
+                    "Best angle applied (network planarity %.2f)."
+                    % result["planarity"]
+                )
+
+        b_angle.clicked.connect(_run_best_angle)
         b_adv.clicked.connect(_open_cutoff_editor)
         b_close.clicked.connect(_dialog.hide)
         apply_appearance.clicked.connect(_apply_appearance)
@@ -3251,6 +3520,10 @@ cmd.extend("interactions_set_appearance", interactions_set_appearance)
 cmd.extend("interactions_visibility", interactions_visibility)
 cmd.extend("interactions_set_cutoff", interactions_set_cutoff)
 cmd.extend("interactions_set_engine", interactions_set_engine)
+cmd.extend(
+    "interactions_set_analysis_profile", interactions_set_analysis_profile
+)
+cmd.extend("interactions_best_angle", interactions_best_angle)
 cmd.extend("interactions_parity_status", interactions_parity_status)
 cmd.extend("show_interaction_legend", show_interaction_legend)
 cmd.extend("interactions_gui", run_plugin_gui)

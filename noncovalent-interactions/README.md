@@ -1,13 +1,44 @@
 # PyMOL Non-Covalent Interactions Plugin
 
-Version 0.6.0 detects and draws intermolecular non-covalent interactions as
+Version 0.7.0 detects and draws intermolecular non-covalent interactions as
 individual, color-coded PyMOL distance objects for docking poses and
 multi-state trajectories.
 
+## Release 0.7.0
+
+Bug-fix and feature release: detection works again on Windows installs,
+solvated pockets and crowded sites, DockLens' second mode axis (analysis
+view) is selectable, and a best-viewing-angle command was added.
+
+- **Fixed - no interactions were detected at all.** The bundled-core
+  integrity check hashed raw bytes, so a Windows checkout (Git rewrites LF
+  to CRLF) failed verification and the plugin raised `ImportError` on
+  import. The digest is now taken over LF-normalised content, which is what
+  the reviewed-source guarantee actually means; tampered content is still
+  rejected.
+- **Fixed - solvated pockets returned nothing.** The per-frame budget
+  charged every water the full receptor x ligand product, so an ordinary
+  structure with crystallographic waters exceeded the limit and aborted.
+  Water screening is linear in each side, and is now costed that way.
+- **Fixed - crowded sites refused to draw.** Passing the drawing limit
+  raised instead of drawing; the closest contacts are now drawn and the
+  remainder reported.
+- **Fixed - the GUI Detect button could die before detecting.** Appearance
+  was applied first and aborted the run when the interacting-residue
+  selection did not exist yet. Detection now runs first and styling of a
+  missing target is skipped instead of raising.
+- **Fixed - nonbonded sphere size did nothing**, because it targeted
+  representation names instead of a selection.
+- **Added - `interactions_set_analysis_profile`**: DockLens' reporting view
+  (`complete` or `ds_like`) as an independent axis from the scientific
+  profile, so every DockLens mode combination is reproducible.
+- **Added - `interactions_best_angle`**: orients the camera to the clearest
+  view of the ligand-protein interaction network.
+
 ## Release 0.6.0
 
-This release synchronizes the PyMOL plugin with DockLens 1.1.0 and the shared
-scientific interaction contract.
+This release synchronized the PyMOL plugin with DockLens 1.1.0 and the
+shared scientific interaction contract.
 
 - Four canonical profiles are available: legacy PLIP, LUNA 0.14, corrected
   DSV-like and conservative LUNA x DSV.
@@ -27,10 +58,48 @@ scientific interaction contract.
 See [CHANGELOG.md](CHANGELOG.md) for the complete release record.
 
 The plugin bundles the reviewed DockLens scientific core and locks it by
-SHA-256. Its current contract is
-`docklens-scientific-profiles-2026.08`. This means PyMOL detection, drawing,
-occupancy, and CSV export use the native DockLens detector criteria; there is
-no additional `ds_like` post-filter.
+SHA-256 over its LF-normalised content. Its current contract is
+`docklens-scientific-profiles-2026.08`. PyMOL detection, drawing, occupancy,
+and CSV export use the native DockLens detector criteria; the `ds_like`
+reporting filter is available on demand through the analysis view below.
+
+## Analysis views (DockLens mode matrix)
+
+The scientific profile and the reporting view are independent axes, which
+together reproduce every DockLens mode:
+
+- `complete` (default): keep every record the profile detects.
+- `ds_like`: DockLens' Discovery Studio reporting filter (DS-reported
+  families only, salt bridges beyond the DS distance ceiling dropped).
+
+```python
+interactions_set_engine luna_dsv          # chemistry profile
+interactions_set_analysis_profile ds_like  # reporting view
+detect_interactions polymer, organic
+```
+
+The active view is reported by `interactions_parity_status` and written to
+the `analysis_profile` column of every CSV export.
+
+## Best viewing angle
+
+After a detection run, `interactions_best_angle` orients the camera to the
+clearest view of the interaction network:
+
+```python
+detect_interactions polymer, organic, show_residues=1
+interactions_best_angle
+interactions_best_angle buffer=3.0
+interactions_best_angle apply=0     # report the view without moving
+```
+
+It runs a principal-component analysis over the interaction endpoints: the
+two directions of largest spread become the screen plane and the thinnest
+direction becomes the viewing axis, so dashes spread out instead of
+stacking behind one another. The ligand is kept on the camera side of the
+receptor, the view is framed on the ligand plus interacting residues, and
+the reported `planarity` (0-1) says how well the network fits one plane.
+It is also available as the GUI's **Best angle** button.
 
 ## Scientific profiles
 

@@ -163,6 +163,21 @@ def _appearance_kwargs(**overrides):
     return kwargs
 
 
+def _source_bytes(path_or_data):
+    """Content with line endings normalised.
+
+    Git rewrites LF to CRLF in a Windows checkout while the installable
+    zip ships LF, so raw-byte equality asserts the checkout style rather
+    than the reviewed content.
+    """
+    data = (
+        path_or_data
+        if isinstance(path_or_data, bytes)
+        else path_or_data.read_bytes()
+    )
+    return data.replace(b"\r\n", b"\n")
+
+
 def _record_pymol_mutations(monkeypatch):
     calls = []
 
@@ -633,7 +648,7 @@ def test_bundled_core_matches_the_plugin_reviewed_digest():
         / "pymol_interactions_plugin"
         / "docklens_core.py"
     )
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256(_source_bytes(path)).hexdigest()
 
     assert digest == plugin._EXPECTED_DOCKLENS_CORE_SHA256
 
@@ -644,7 +659,7 @@ def test_bundled_analysis_profile_matches_the_plugin_reviewed_digest():
         / "pymol_interactions_plugin"
         / "docklens_analysis_profiles.py"
     )
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256(_source_bytes(path)).hexdigest()
 
     assert digest == plugin._EXPECTED_ANALYSIS_PROFILE_SHA256
 
@@ -657,9 +672,18 @@ def test_unreviewed_fallback_module_is_rejected_before_import(tmp_path):
         plugin._verify_reviewed_source(path, "0" * 64)
 
 
-def test_compute_budget_accounts_for_water_bridge_cartesian_work():
-    assert plugin._estimate_compute_cost(10, 20, 3, include_water=True) == 890
+def test_compute_budget_tracks_linear_water_screening():
+    # Each water is screened once against each side, not once per
+    # receptor x ligand pair. The old cartesian model rejected ordinary
+    # solvated pockets, so detection returned nothing at all.
+    assert plugin._estimate_compute_cost(10, 20, 3, include_water=True) == 290
     assert plugin._estimate_compute_cost(10, 20, 3, include_water=False) == 200
+
+
+def test_solvated_pocket_stays_within_the_per_frame_budget():
+    cost = plugin._estimate_compute_cost(4000, 40, 150, include_water=True)
+
+    assert cost <= plugin.MAX_COMPUTE_COST_PER_FRAME
 
 
 def test_root_and_plugin_manager_sources_are_identical():
@@ -703,29 +727,29 @@ def test_installable_zip_contains_the_exact_reviewed_sources():
             "docklens_core.py",
             "docklens_analysis_profiles.py",
         ):
-            assert archive.read("pymol_interactions_plugin/" + name) == (
-                root / "pymol_interactions_plugin" / name
-            ).read_bytes()
+            assert _source_bytes(
+                archive.read("pymol_interactions_plugin/" + name)
+            ) == _source_bytes(root / "pymol_interactions_plugin" / name)
 
 
 def test_plugin_copies_and_zip_bundle_are_synchronized():
     root = Path(__file__).parents[1]
     package = root / "pymol_interactions_plugin"
-    root_plugin = (root / "interactions_plugin.py").read_bytes()
-    packaged_plugin = (package / "interactions_plugin.py").read_bytes()
+    root_plugin = _source_bytes(root / "interactions_plugin.py")
+    packaged_plugin = _source_bytes(package / "interactions_plugin.py")
 
     assert root_plugin == packaged_plugin
     with zipfile.ZipFile(root / "pymol_interactions_plugin.zip") as archive:
-        assert archive.read(
-            "pymol_interactions_plugin/interactions_plugin.py"
+        assert _source_bytes(
+            archive.read("pymol_interactions_plugin/interactions_plugin.py")
         ) == root_plugin
         for module_name in (
             "docklens_core.py",
             "docklens_analysis_profiles.py",
         ):
-            assert archive.read(
-                "pymol_interactions_plugin/" + module_name
-            ) == (package / module_name).read_bytes()
+            assert _source_bytes(
+                archive.read("pymol_interactions_plugin/" + module_name)
+            ) == _source_bytes(package / module_name)
 
 
 def test_dsv_is_the_default_engine_for_docklens_figure_parity():
@@ -1450,3 +1474,319 @@ def test_ds_inferred_hbond_remains_available_without_explicit_hydrogen():
     assert len(records) == 1
     assert records[0]["chemistry_basis"] == "inferred_hydrogen"
     assert records[0]["confidence"] == "medium"
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 regressions: the plugin had stopped reporting interactions entirely
+# --------------------------------------------------------------------------
+
+
+def test_reviewed_digest_accepts_a_windows_checkout(tmp_path):
+    """A CRLF checkout must still load: LF and CRLF are the same source."""
+    reviewed = b"value = 1\norther = 2\n"
+    digest = hashlib.sha256(reviewed).hexdigest()
+    windows_copy = tmp_path / "docklens_core.py"
+    windows_copy.write_bytes(reviewed.replace(b"\n", b"\r\n"))
+
+    assert plugin._verify_reviewed_source(windows_copy, digest) == windows_copy
+
+
+def test_reviewed_digest_still_rejects_modified_content(tmp_path):
+    tampered = tmp_path / "docklens_core.py"
+    tampered.write_bytes(b"raise RuntimeError('must never execute')")
+
+    with pytest.raises(ImportError, match="integrity"):
+        plugin._verify_reviewed_source(tampered, "0" * 64)
+
+
+def _stub_scene_commands(monkeypatch):
+    """No-op the PyMOL scene calls detect_interactions makes."""
+    for command in (
+        "set_color",
+        "delete",
+        "disable",
+        "enable",
+        "group",
+        "hide",
+        "show",
+        "select",
+        "deselect",
+        "set",
+        "color",
+        "distance",
+        "pseudoatom",
+    ):
+        monkeypatch.setattr(
+            plugin.cmd, command, lambda *_a, **_k: None, raising=False
+        )
+    monkeypatch.setattr(
+        plugin.cmd, "get_names", lambda *_a, **_k: [], raising=False
+    )
+    monkeypatch.setattr(
+        plugin.cmd, "count_atoms", lambda *_a, **_k: 0, raising=False
+    )
+
+
+def test_busy_pocket_keeps_drawing_instead_of_raising(monkeypatch):
+    """A crowded site must still show interactions, closest ones first."""
+    _stub_scene_commands(monkeypatch)
+    crowded = [
+        {
+            "type": "alkyl",
+            "subtype": "",
+            "a_label": "LEU%d_CD1" % index,
+            "b_label": "LIG1_C1",
+            "a_point": np.array([float(index), 0.0, 0.0]),
+            "b_point": np.array([float(index), 1.0, 0.0]),
+            "a_sele": "(resn LEU)",
+            "b_sele": "(resn LIG)",
+            "dist": float(plugin.MAX_DRAWN_INTERACTIONS + 10 - index),
+        }
+        for index in range(plugin.MAX_DRAWN_INTERACTIONS + 25)
+    ]
+    monkeypatch.setattr(
+        plugin,
+        "_compute_interactions",
+        lambda *_args, **_kwargs: (crowded, True),
+    )
+    drawn = []
+    monkeypatch.setattr(
+        plugin,
+        "_draw",
+        lambda record, *_args, **_kwargs: drawn.append(record),
+    )
+
+    counts = plugin.detect_interactions()
+
+    assert sum(counts.values()) == plugin.MAX_DRAWN_INTERACTIONS
+    assert len(drawn) == plugin.MAX_DRAWN_INTERACTIONS
+    assert max(record["dist"] for record in drawn) < max(
+        record["dist"] for record in crowded
+    )
+
+
+def test_appearance_survives_a_missing_residue_selection(monkeypatch):
+    """Styling <group>_residues before any detection must not abort."""
+    calls = _record_pymol_mutations(monkeypatch)
+
+    def _color(color, selection, *_args, **_kwargs):
+        if "residues" in str(selection):
+            raise RuntimeError("Invalid selection name")
+        calls.append(("color", (color, selection), {}))
+
+    monkeypatch.setattr(plugin.cmd, "color", _color, raising=False)
+    monkeypatch.setattr(plugin, "_dash_base", {"hbond_dash": (0.35, 0.35)})
+
+    plugin.interactions_set_appearance(**_appearance_kwargs())
+
+    assert _color_was_applied(calls, "gray70", "polymer")
+    assert _color_was_applied(calls, "orange", "organic")
+    assert _setting_was_applied(calls, {"dash_radius"}, 0.09)
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 features: DockLens analysis views and the best viewing angle
+# --------------------------------------------------------------------------
+
+
+def test_analysis_views_match_the_bundled_docklens_names():
+    assert set(plugin.ANALYSIS_PROFILES) == set(
+        plugin._docklens_analysis_profiles.VALID_ANALYSIS_PROFILES
+    )
+
+
+def test_analysis_view_filters_records_like_docklens(monkeypatch):
+    cation = _atom(1, "N", (0, 0, 0), "NQ", sybyl_type="N.4", fcharge=1)
+    monkeypatch.setattr(
+        plugin,
+        "_load_atoms",
+        lambda selection, _state, index_offset=0: (
+            ([cation], False)
+            if selection == "receptor"
+            else (
+                [
+                    _atom(
+                        index_offset,
+                        "O",
+                        (4.6, 0, 0),
+                        "O1",
+                        sybyl_type="O.co2",
+                        fcharge=-1,
+                    )
+                ],
+                False,
+            )
+        ),
+    )
+    plugin.interactions_set_engine("plip")
+    try:
+        plugin.interactions_set_analysis_profile("complete")
+        complete, _has_h = plugin._compute_interactions(
+            "receptor", "ligand", ["saltbridge"], 1
+        )
+        plugin.interactions_set_analysis_profile("ds_like")
+        ds_like, _has_h = plugin._compute_interactions(
+            "receptor", "ligand", ["saltbridge"], 1
+        )
+    finally:
+        plugin.interactions_set_analysis_profile("complete")
+        plugin.interactions_set_engine("dsv")
+
+    assert len(complete) == 1
+    # 4.6 A exceeds DockLens' DS reporting ceiling for salt bridges
+    assert ds_like == []
+
+
+def test_unknown_analysis_view_is_rejected_without_changing_state():
+    try:
+        assert plugin.interactions_set_analysis_profile("nonsense") is None
+        assert plugin._active_analysis_profile[0] == "complete"
+    finally:
+        plugin.interactions_set_analysis_profile("complete")
+
+
+def test_best_angle_looks_down_the_thin_axis_of_the_network(monkeypatch):
+    """Interactions spread in x/y, thin in z -> camera looks along z."""
+    points = [
+        (np.array([0.0, 0.0, 0.0]), np.array([4.0, 0.0, 0.02])),
+        (np.array([0.0, 3.0, 0.0]), np.array([4.0, 3.0, -0.02])),
+        (np.array([2.0, 1.0, 0.01]), np.array([2.0, -3.0, 0.0])),
+    ]
+    monkeypatch.setattr(plugin, "_last_interaction_points", points)
+    monkeypatch.setattr(
+        plugin,
+        "_last_detection_context",
+        {"sel1": "polymer", "sel2": "organic", "group_name": "interactions"},
+    )
+    extents = {
+        "polymer": ((0.0, 0.0, -6.0), (4.0, 3.0, -4.0)),
+        "organic": ((0.0, 0.0, 4.0), (4.0, 3.0, 6.0)),
+    }
+    monkeypatch.setattr(
+        plugin.cmd,
+        "get_extent",
+        lambda selection, *_a, **_k: extents.get(
+            selection, ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugin.cmd,
+        "get_view",
+        lambda *_a, **_k: tuple([1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0] + [0.0] * 9),
+        raising=False,
+    )
+    applied = {}
+    monkeypatch.setattr(
+        plugin.cmd,
+        "set_view",
+        lambda view: applied.setdefault("view", list(view)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugin.cmd,
+        "zoom",
+        lambda *args, **_k: applied.setdefault("zoom", args),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plugin.cmd, "count_atoms", lambda *_a, **_k: 0, raising=False
+    )
+
+    result = plugin.interactions_best_angle()
+
+    assert result is not None
+    view_axis = np.asarray(result["view_axis"], dtype=float)
+    # the thin direction of this network is z
+    assert abs(float(view_axis[2])) > 0.99
+    # the ligand (z > 0) must end up on the camera side of the receptor
+    assert float(view_axis[2]) > 0.0
+    assert result["planarity"] > 0.99
+    assert applied["view"][0:9] == pytest.approx(
+        [
+            float(value)
+            for row in (
+                result["right"],
+                result["up"],
+                result["view_axis"],
+            )
+            for value in row
+        ]
+    )
+
+
+def test_best_angle_can_report_without_moving_the_camera(monkeypatch):
+    points = [
+        (np.array([0.0, 0.0, 0.0]), np.array([4.0, 0.0, 0.0])),
+        (np.array([0.0, 3.0, 0.0]), np.array([4.0, 3.0, 0.0])),
+    ]
+    monkeypatch.setattr(plugin, "_last_interaction_points", points)
+    monkeypatch.setattr(
+        plugin,
+        "_last_detection_context",
+        {"sel1": "polymer", "sel2": "organic", "group_name": "interactions"},
+    )
+    monkeypatch.setattr(
+        plugin.cmd,
+        "get_extent",
+        lambda *_a, **_k: ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        raising=False,
+    )
+    moved = []
+    monkeypatch.setattr(
+        plugin.cmd, "set_view", lambda *_a, **_k: moved.append(True),
+        raising=False,
+    )
+
+    result = plugin.interactions_best_angle(apply=0)
+
+    assert result is not None
+    assert moved == []
+
+
+def test_best_angle_needs_a_detection_run_first(monkeypatch):
+    monkeypatch.setattr(plugin, "_last_interaction_points", [])
+
+    assert plugin.interactions_best_angle() is None
+
+
+def test_gui_exposes_the_analysis_view_and_best_angle_controls():
+    source = inspect.getsource(plugin.run_plugin_gui).lower()
+
+    assert "analysis_profiles" in source
+    assert "interactions_set_analysis_profile" in source
+    assert "analysis view" in source
+    assert "best angle" in source
+    assert "interactions_best_angle" in source
+    # detection must not sit behind a successful appearance pass
+    detect_body = source.split("def _run():", 1)[1].split("def _run_occ", 1)[0]
+    assert "if not _apply_appearance():" not in detect_body
+
+
+def test_detection_records_geometry_for_the_best_angle(monkeypatch):
+    _stub_scene_commands(monkeypatch)
+    records = [
+        {
+            "type": "hbond",
+            "subtype": "",
+            "a_label": "SER90_OG",
+            "b_label": "LIG1_O1",
+            "a_point": np.array([0.0, 0.0, 0.0]),
+            "b_point": np.array([2.8, 0.0, 0.0]),
+            "a_sele": "(resn SER)",
+            "b_sele": "(resn LIG)",
+            "dist": 2.8,
+        }
+    ]
+    monkeypatch.setattr(
+        plugin,
+        "_compute_interactions",
+        lambda *_args, **_kwargs: (records, True),
+    )
+    monkeypatch.setattr(plugin, "_draw", lambda *_args, **_kwargs: None)
+
+    plugin.detect_interactions("polymer", "organic")
+
+    assert len(plugin._last_interaction_points) == 1
+    assert plugin._last_detection_context["sel2"] == "organic"
+
