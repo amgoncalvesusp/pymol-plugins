@@ -1790,3 +1790,57 @@ def test_detection_records_geometry_for_the_best_angle(monkeypatch):
     assert len(plugin._last_interaction_points) == 1
     assert plugin._last_detection_context["sel2"] == "organic"
 
+
+
+@pytest.mark.parametrize(
+    "threshold, expected",
+    [(75, ["persistent"]), (50, ["persistent", "transient"]),
+     (101, None), (float("nan"), None), (-1, None)],
+)
+def test_occupancy_draws_only_qualifying_final_frame_contacts(monkeypatch, threshold, expected):
+    _stub_scene_commands(monkeypatch)
+    monkeypatch.setattr(plugin.cmd, "count_states", lambda *_a: 2, raising=False)
+    def record(label):
+        return {"type": "hbond", "subtype": "", "a_label": label,
+                "b_label": "LIG1_O1", "a_point": np.array([0., 0., 0.]),
+                "b_point": np.array([2.8, 0., 0.]), "a_sele": "polymer",
+                "b_sele": "organic", "dist": 2.8}
+    frames = {1: [record("persistent"), record("absent_at_end")],
+              2: [record("persistent"), record("transient")]}
+    computed = []
+    def compute(_s1, _s2, _types, state):
+        computed.append(state)
+        return frames[state], True
+    monkeypatch.setattr(plugin, "_compute_interactions", compute)
+    drawn = []
+    monkeypatch.setattr(plugin, "_draw", lambda item, *_a: drawn.append(item["a_label"]))
+    if expected is None:
+        with pytest.raises(ValueError, match="threshold"):
+            plugin.interactions_occupancy(threshold=threshold, draw=1)
+        assert computed == []
+    else:
+        plugin.interactions_occupancy(threshold=threshold, draw=1)
+        assert drawn == expected
+        assert computed == [1, 2]
+
+
+def test_plugin_manager_reports_current_release_version():
+    package = importlib.import_module("pymol_interactions_plugin")
+    assert package.__version__ == "0.7.1"
+
+
+@pytest.mark.parametrize("target_type", ["object:molecule", "object:group"])
+@pytest.mark.parametrize("operation", ["detect", "clear"])
+def test_existing_user_object_is_not_deleted_by_group_name(monkeypatch, target_type, operation):
+    _stub_scene_commands(monkeypatch)
+    monkeypatch.setattr(plugin.cmd, "get_names", lambda *_a, **_k: ["protein"])
+    monkeypatch.setattr(plugin.cmd, "get_type", lambda _name: target_type, raising=False)
+    deleted = []
+    monkeypatch.setattr(plugin.cmd, "delete", deleted.append)
+    monkeypatch.setattr(plugin, "_compute_interactions", lambda *_a: ([], True))
+    with pytest.raises(ValueError, match="already exists"):
+        if operation == "detect":
+            plugin.detect_interactions(group_name="protein")
+        else:
+            plugin.interactions_visibility("clear", group_name="protein")
+    assert deleted == []

@@ -1,8 +1,14 @@
 # PyMOL Non-Covalent Interactions Plugin
 
-Version 0.7.0 detects and draws intermolecular non-covalent interactions as
+Version 0.7.1 detects and draws intermolecular non-covalent interactions as
 individual, color-coded PyMOL distance objects for docking poses and
 multi-state trajectories.
+
+## Release 0.7.1
+
+This patch release applies occupancy thresholds to drawn contacts, rejects
+invalid thresholds before touching a PyMOL session, and protects user objects
+from group-name collisions. Sources and the Plugin Manager ZIP are synchronized.
 
 ## Release 0.7.0
 
@@ -202,6 +208,15 @@ interactions_visibility hide
 interactions_visibility show
 interactions_visibility clear
 ```
+
+With `interactions_occupancy ..., threshold=75, draw=1`, the table and drawing
+both apply the occupancy threshold (a finite percentage from 0 to 100).
+The drawing uses only qualifying contacts present in the final analyzed state;
+contacts absent from that state remain in the table but are not drawn.
+
+Detection and clearing refuse a `group_name` already occupied by a molecule
+or a group not created by this loaded plugin instance. Choose a new group name
+when retaining groups restored from an earlier session.
 
 The default `polymer` receptor is expanded to `polymer or metals` for
 `dsv` and `luna_dsv`, matching the bundled detector scope for

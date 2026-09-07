@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from .bundle_reader import BundleReader
@@ -15,6 +16,13 @@ class PyMOLVisualization:
         self.cmd = command
         self.reader = reader
         self.analysis_id = str(reader.manifest["analysis_id"])
+        existing = self.cmd.get_names("all") if hasattr(self.cmd, "get_names") else ()
+        if isinstance(existing, (list, tuple, set)):
+            base = self.analysis_id
+            suffix = 1
+            while any(str(name).startswith(selection_name(self.analysis_id, "REF")[:-3]) for name in existing):
+                self.analysis_id = f"{base[:24]}_{suffix}"
+                suffix += 1
         self.created_objects: list[str] = []
         self.created_selections: list[str] = []
         self.active_target: str | None = self.reader.target_ids[0] if self.reader.target_ids else None
@@ -24,13 +32,19 @@ class PyMOLVisualization:
         for index, structure_id in enumerate((self.reader.reference_id, *self.reader.target_ids)):
             object_name = selection_name(self.analysis_id, "REF" if index == 0 else f"T{index:03d}")
             structure_text = self.reader.structure_bytes(structure_id).decode("utf-8")
-            if hasattr(self.cmd, "read_pdbstr"):
-                self.cmd.read_pdbstr(structure_text, object_name)
-            elif hasattr(self.cmd, "loadstr"):
-                self.cmd.loadstr(structure_text, object_name)
-            elif hasattr(self.cmd, "load"):
-                self.cmd.load(str(self.reader.materialize_structure(structure_id)), object_name)
+            is_cif = Path(self.reader.structure_entry(structure_id)).suffix.lower() in {".cif", ".mmcif"}
+            loader = getattr(self.cmd, "read_cifstr" if is_cif else "read_pdbstr", None)
             self.created_objects.append(object_name)
+            if loader is not None:
+                loader(structure_text, object_name)
+            elif hasattr(self.cmd, "load"):
+                path = self.reader.materialize_structure(structure_id)
+                try:
+                    self.cmd.load(str(path), object_name)
+                finally:
+                    path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError("PyMOL has no compatible structure loader")
             objects.append(object_name)
         self.apply_transforms(objects)
         return tuple(objects)
@@ -40,7 +54,11 @@ class PyMOLVisualization:
         for object_name, structure_id in zip(
             objects, (self.reader.reference_id, *self.reader.target_ids), strict=True
         ):
-            transform = transforms.get(structure_id) or transforms.get("target")
+            if structure_id == self.reader.reference_id:
+                continue
+            transform = transforms.get(structure_id)
+            if transform is None and len(self.reader.target_ids) == 1:
+                transform = transforms.get("target")
             if not transform or not hasattr(self.cmd, "transform_object"):
                 continue
             rotation = transform.get("rotation")
@@ -48,15 +66,15 @@ class PyMOLVisualization:
             if rotation is None or translation is None:
                 continue
             matrix = (
-                [value for row in rotation for value in row]
-                + list(translation)
+                [float(value) for index in range(3)
+                 for value in (*[rotation[row][index] for row in range(3)], translation[index])]
                 + [0.0, 0.0, 0.0, 1.0]
             )
             self.cmd.transform_object(object_name, matrix)
 
     def create_semantic_selections(self) -> dict[str, str]:
         selections: dict[str, str] = {}
-        rows = self.reader.correspondence()
+        rows = [row for row in self.reader.correspondence() if self._is_active(row)]
         for category, predicate in (
             ("mutations", lambda row: row.get("status") == "substitution"),
             ("key_residues", lambda row: row.get("is_key_residue", False)),
@@ -64,11 +82,12 @@ class PyMOLVisualization:
             ("insertions", lambda row: row.get("status") == "insertion"),
             ("deletions", lambda row: row.get("status") == "deletion"),
         ):
-            name = selection_name(self.analysis_id, category)
+            name = selection_name(self.analysis_id, category, self.active_target)
+            field = "reference" if category == "deletions" else "target"
+            structure_id = self.reader.reference_id if field == "reference" else self.active_target
             expressions = [
-                _pymol_locator(row.get("target"))
-                for row in rows
-                if predicate(row) and row.get("target")
+                self._locator(row[field], structure_id)
+                for row in rows if predicate(row) and row.get(field)
             ]
             if hasattr(self.cmd, "select"):
                 self.cmd.select(name, " or ".join(expressions) or "none")
@@ -85,7 +104,7 @@ class PyMOLVisualization:
             name = selection_name(self.analysis_id, self.active_target or "target", f"interactions_{change}")
             expressions: list[str] = []
             for item in records if isinstance(records, list) else []:
-                if item.get("change") != change:
+                if item.get("change") != change or not self._is_active(item):
                     continue
                 record = item.get("target_record") if change != "lost" else item.get("reference_record")
                 if not isinstance(record, dict):
@@ -93,7 +112,9 @@ class PyMOLVisualization:
                 for field in ("residue_a", "residue_b"):
                     residue = record.get(field)
                     if isinstance(residue, dict):
-                        expressions.append(_pymol_locator(residue))
+                        expressions.append(self._locator(
+                            residue, self.reader.reference_id if change == "lost" else self.active_target
+                        ))
             expression = " or ".join(dict.fromkeys(expressions)) or "none"
             if hasattr(self.cmd, "select"):
                 self.cmd.select(name, expression)
@@ -108,7 +129,8 @@ class PyMOLVisualization:
         for label, structure_id in (("reference", self.reader.reference_id), ("target", self.active_target)):
             name = selection_name(self.analysis_id, self.active_target or "target", f"site_{site_id}_{label}")
             residues = site.get(label, site.get(f"{label}_residues", [])) if isinstance(site, dict) else []
-            expressions = [_pymol_locator(item) for item in residues if isinstance(item, dict)]
+            expressions = [self._locator(item, structure_id) for item in residues
+                           if isinstance(item, dict) and self._is_active(item)]
             if hasattr(self.cmd, "select"):
                 self.cmd.select(name, " or ".join(expressions) or "none")
             self.created_selections.append(name)
@@ -116,10 +138,10 @@ class PyMOLVisualization:
         return output
 
     def draw_displacement_vectors(self, *, minimum_magnitude: float = 0.5, top_n: int = 100) -> str:
-        """Draw bundle-provided arrows; no transform or magnitude is recomputed."""
+        """Draw stored displacement segments without recomputing scientific values."""
         payload = self.reader.vectors()
-        vectors = payload.get("vectors", payload if isinstance(payload, list) else [])
-        selected = [item for item in vectors if isinstance(item, dict) and float(item.get("magnitude_angstrom", 0.0)) >= minimum_magnitude]
+        vectors = payload if isinstance(payload, list) else payload.get("vectors", [])
+        selected = [item for item in vectors if isinstance(item, dict) and self._is_active(item) and float(item.get("magnitude_angstrom", 0.0)) >= minimum_magnitude]
         selected.sort(key=lambda item: (-float(item.get("magnitude_angstrom", 0.0)), str(item.get("reference_position", ""))))
         selected = selected[:top_n]
         object_name = selection_name(self.analysis_id, self.active_target or "target", "displacement_vectors")
@@ -130,7 +152,9 @@ class PyMOLVisualization:
                 end = item.get("end_xyz")
                 if not isinstance(start, list | tuple) or not isinstance(end, list | tuple) or len(start) != 3 or len(end) != 3:
                     continue
-                primitives.extend([0.0, float(start[0]), float(start[1]), float(start[2]), float(end[0]), float(end[1]), float(end[2]), 0.08])
+                # CGO CYLINDER: opcode, endpoints, radius, start/end RGB.
+                primitives.extend([9.0, *map(float, start), *map(float, end),
+                                   0.08, 1.0, 0.5, 0.0, 1.0, 0.5, 0.0])
             self.cmd.load_cgo(primitives, object_name)
             self.created_objects.append(object_name)
         return object_name
@@ -138,7 +162,7 @@ class PyMOLVisualization:
     def evidence_card(self, reference_position: str, target_id: str | None = None) -> dict[str, Any] | None:
         """Return the stored evidence card; this method never calculates science."""
         payload = self.reader.evidence()
-        cards = payload.get("cards", payload if isinstance(payload, list) else [])
+        cards = payload if isinstance(payload, list) else payload.get("cards", [])
         for card in cards if isinstance(cards, list) else []:
             if card.get("reference_position") == reference_position and (target_id is None or card.get("target_id") == target_id):
                 return dict(card)
@@ -148,6 +172,7 @@ class PyMOLVisualization:
         if target_id not in self.reader.target_ids:
             raise KeyError(target_id)
         self.active_target = target_id
+        self.create_semantic_selections()
 
     def focus_selection(self, category: str = "mutations") -> str:
         name = selection_name(self.analysis_id, category, self.active_target)
@@ -177,7 +202,19 @@ class PyMOLVisualization:
         if hasattr(self.cmd, "color"):
             self.cmd.color(COLORS["reference"], selection_name(self.analysis_id, "REF"))
         if name.lower().startswith("mutation") and hasattr(self.cmd, "show"):
-            self.cmd.show("sticks", selection_name(self.analysis_id, "mutations"))
+            self.cmd.show("sticks", selection_name(self.analysis_id, "mutations", self.active_target))
+
+    def _is_active(self, record: dict[str, Any]) -> bool:
+        return record.get("target_id", self.active_target) == self.active_target
+
+    def _locator(self, residue: dict[str, Any], structure_id: str | None) -> str:
+        if structure_id == self.reader.reference_id:
+            category = "REF"
+        elif structure_id in self.reader.target_ids:
+            category = f"T{self.reader.target_ids.index(structure_id) + 1:03d}"
+        else:
+            return "none"
+        return f"(model {selection_name(self.analysis_id, category)} and ({_pymol_locator(residue)}))"
 
     def reset(self) -> None:
         for name in (*self.created_selections, *self.created_objects):
@@ -192,9 +229,10 @@ def _pymol_locator(residue: dict[str, Any]) -> str:
     number = str(residue.get("auth_seq_id", ""))
     insertion = str(residue.get("insertion_code") or "")
     if (
-        not re.fullmatch(r"[A-Za-z0-9_.-]+", chain)
+        not re.fullmatch(r"[A-Za-z0-9_.-]*", chain)
         or not re.fullmatch(r"-?\d+", number)
         or not re.fullmatch(r"[A-Za-z]?", insertion)
     ):
         return "none"
-    return f"chain {chain} and resi {number}{insertion}"
+    chain_token = chain or '""'
+    return f"chain {chain_token} and resi {number}{insertion}"

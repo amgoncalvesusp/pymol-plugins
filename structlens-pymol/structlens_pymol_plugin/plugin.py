@@ -16,8 +16,9 @@ def __init_plugin__(app: Any = None) -> None:
     except ImportError as error:
         raise RuntimeError("StructLens-PyMOL must be loaded inside PyMOL") from error
     _controller = register_commands(cmd)
-    if app is not None and hasattr(app, "addmenuitemqt"):
-        app.addmenuitemqt("StructLens-PyMOL", lambda: open_analysis())
+    from pymol.plugins import addmenuitemqt
+
+    addmenuitemqt("StructLens-PyMOL", lambda: open_analysis())
 
 
 def open_analysis(path: str | None = None) -> Any:

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1 — 2026-09-06
+
+- Applied occupancy thresholds to contacts drawn at the final frame.
+- Rejected non-finite and out-of-range occupancy thresholds before detection.
+- Protected user-owned PyMOL objects from interaction-group name collisions.
+- Synchronized the Plugin Manager package with the reviewed source.
+
 ## 0.7.0 — 2026-09-01
 
 ### Fixed

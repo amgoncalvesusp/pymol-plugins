@@ -175,7 +175,7 @@ except (ImportError, ValueError):
 
 
 DSV_PARITY_CONTRACT = "docklens-scientific-profiles-2026.08"
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.7.1"
 
 
 def _module_source_sha256(module):
@@ -1714,6 +1714,7 @@ def _matches_ds_like(interaction):
 _HELPER = "_ii_pts"  # hidden object holding centroid/endpoint pseudoatoms
 _PSEUDO_COUNTER = [0]
 _drawn_names = set()
+_managed_groups = set()
 # name -> (base_dash_length, base_dash_gap); lets the appearance controls scale
 # the per-type dash pattern without losing the sandwich/T-shaped/dotted encoding.
 _dash_base = {}
@@ -1999,45 +2000,21 @@ def _compute_interactions(sel1, sel2, req_types, state):
     return inters, has_h
 
 
-def detect_interactions(
-    sel1="polymer",
-    sel2="organic",
-    types="all",
-    state=1,
-    disable_native_hbond=1,
-    group_name="interactions",
-    label=0,
-    show_residues=0,
-    engine="",
-):
-    """Detect and draw non-covalent interactions between sel1 and sel2.
+def _check_group_ownership(group_name):
+    """Refuse to replace objects not created as an interaction group here."""
+    if group_name in cmd.get_names("all"):
+        if (group_name not in _managed_groups
+                or cmd.get_type(group_name) != "object:group"):
+            raise ValueError(
+                "group_name '%s' already exists and is not a managed interaction group; "
+                "choose a different group_name" % group_name
+            )
 
-    See the module docstring for full parameter documentation and examples.
-    Re-run with a different `state` to recompute a specific MD frame; the
-    interaction group is rebuilt from scratch on every call.
 
-    sel2='auto' picks the ligand automatically (organic, else non-polymer).
-    show_residues 1 => also display interacting residues as sticks in a
-        selection named '<group_name>_residues'.
-    engine  '' (default) keeps the active profile; plip, luna, dsv, luna_dsv,
-        or legacy ds switches profile first (see interactions_set_engine).
-    """
-    if engine:
-        interactions_set_engine(engine)
-    _register_colors()
-    sel1 = _resolve_receptor_selection(_resolve_selection(sel1))
-    sel2 = _resolve_selection(sel2)
-    state = int(state)
-    keep_label = int(label) != 0
-    do_disable = int(disable_native_hbond) != 0
-    do_residues = int(show_residues) != 0
-    req_types = _parse_types(types)
-    group_name = _validate_group_name(group_name)
-
-    inters, has_h = _compute_interactions(sel1, sel2, req_types, state)
-    if has_h is None:
-        print("[interactions] empty selection (sel1 or sel2 has no atoms).")
-        return
+def _display_interactions(inters, sel1, sel2, group_name, keep_label=False,
+                          do_disable=True, do_residues=False):
+    """Rebuild the scene from an already computed, filtered contact set."""
+    _check_group_ownership(group_name)
     dropped = 0
     if len(inters) > MAX_DRAWN_INTERACTIONS:
         # Draw the closest contacts instead of refusing the whole run: a
@@ -2077,6 +2054,54 @@ def detect_interactions(
 
     if do_residues and res_seles:
         _show_residue_sticks(sel1, sel2, res_seles, group_name)
+
+    if counts:
+        _managed_groups.add(group_name)
+    return counts, dropped, res_seles
+
+
+def detect_interactions(
+    sel1="polymer",
+    sel2="organic",
+    types="all",
+    state=1,
+    disable_native_hbond=1,
+    group_name="interactions",
+    label=0,
+    show_residues=0,
+    engine="",
+):
+    """Detect and draw non-covalent interactions between sel1 and sel2.
+
+    See the module docstring for full parameter documentation and examples.
+    Re-run with a different `state` to recompute a specific MD frame; the
+    interaction group is rebuilt from scratch on every call.
+
+    sel2='auto' picks the ligand automatically (organic, else non-polymer).
+    show_residues 1 => also display interacting residues as sticks in a
+        selection named '<group_name>_residues'.
+    engine  '' (default) keeps the active profile; plip, luna, dsv, luna_dsv,
+        or legacy ds switches profile first (see interactions_set_engine).
+    """
+    if engine:
+        interactions_set_engine(engine)
+    _register_colors()
+    sel1 = _resolve_receptor_selection(_resolve_selection(sel1))
+    sel2 = _resolve_selection(sel2)
+    state = int(state)
+    keep_label = int(label) != 0
+    do_disable = int(disable_native_hbond) != 0
+    do_residues = int(show_residues) != 0
+    req_types = _parse_types(types)
+    group_name = _validate_group_name(group_name)
+
+    inters, has_h = _compute_interactions(sel1, sel2, req_types, state)
+    if has_h is None:
+        print("[interactions] empty selection (sel1 or sel2 has no atoms).")
+        return
+    counts, dropped, res_seles = _display_interactions(
+        inters, sel1, sel2, group_name, keep_label, do_disable, do_residues
+    )
 
     total = sum(counts.values())
     print(
@@ -2148,6 +2173,7 @@ def interactions_occupancy(
     draw  1 => draw the interactions that pass `threshold` at state `end`.
     csv   path => also write the occupancy table to a CSV file.
     """
+    threshold = _validate_appearance_float(threshold, "threshold", 0.0, 100.0)
     _register_colors()
     sel1 = _resolve_receptor_selection(_resolve_selection(sel1))
     sel2 = _resolve_selection(sel2)
@@ -2170,7 +2196,7 @@ def interactions_occupancy(
             % MAX_OCCUPANCY_FRAMES
         )
     if int(draw):
-        _validate_group_name(group_name)
+        group_name = _validate_group_name(group_name)
 
     tally = {}  # key -> [count, sample_inter]
     total_compute_cost = 0
@@ -2248,11 +2274,16 @@ def interactions_occupancy(
         print("  occupancy table written to %s" % csv)
 
     if int(draw):
-        # Redraw the full interaction set at the final state. Note: `threshold`
-        # filters the printed/CSV table only, not which dashes are drawn.
-        detect_interactions(
-            sel1, sel2, types=req_types, state=end, group_name=group_name
+        qualifying = {_interaction_key(sample) for _occ, _cnt, sample in rows}
+        final_contacts = [it for it in inters if _interaction_key(it) in qualifying]
+        counts, dropped, _res_seles = _display_interactions(
+            final_contacts, sel1, sel2, group_name
         )
+        print("  %d qualifying interaction(s) drawn at state %d"
+              % (sum(counts.values()), end))
+        if dropped:
+            print("  %d qualifying interaction(s) omitted by the drawing limit"
+                  % dropped)
     return rows
 
 
@@ -2745,10 +2776,12 @@ def interactions_visibility(action="show", group_name="interactions"):
         for t in targets:
             cmd.disable(t)
     elif action == "clear":
+        _check_group_ownership(group_name)
         for t in targets + [_HELPER]:
             cmd.delete(t)
         _drawn_names.clear()
         _dash_base.clear()
+        _managed_groups.discard(group_name)
     else:
         print("[interactions] visibility: action must be show|hide|clear")
         return
