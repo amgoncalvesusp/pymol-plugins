@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.2 — 2026-09-15
+
+- Synchronized the reviewed DockLens core for reproducible atom/ring ordering
+  and stable interaction identities across reloads and atom renumbering.
+- Recognized complete, planar standard protein aromatic rings when PDB lacks
+  SYBYL typing, restoring eligible pi-sulfur contacts. Explicit non-aromatic
+  typing still overrides this fallback.
+- Prevented duplicate protein ionic centers from PyMOL-inferred formal charges.
+- Evaluated all bonded heavy-atom donor directions for chalcogen bonds, so
+  sulfur contacts no longer depend on which neighbor appears first.
+- Normalized PyMOL's unknown atom type (`??`) and kept untyped PDB connectivity
+  without promoting PyMOL-inferred bond orders to declared chemical evidence.
+- Applied protein, ligand, and interacting-residue colors only to carbon atoms;
+  other atoms retain standard PyMOL element colors, including sulfur.
+- Updated the parity contract to `docklens-scientific-profiles-2026.09` and
+  synchronized sources, integrity checks, and the Plugin Manager ZIP.
+
 ## 0.7.1 — 2026-09-06
 
 - Applied occupancy thresholds to contacts drawn at the final frame.

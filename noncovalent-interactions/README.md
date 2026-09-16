@@ -1,8 +1,16 @@
 # PyMOL Non-Covalent Interactions Plugin
 
-Version 0.7.1 detects and draws intermolecular non-covalent interactions as
+Version 0.7.2 detects and draws intermolecular non-covalent interactions as
 individual, color-coded PyMOL distance objects for docking poses and
 multi-state trajectories.
+
+## Release 0.7.2
+
+This patch synchronizes reproducible atom/ring ordering and protein ionic
+centers with DockLens, normalizes PyMOL's untyped PDB chemistry, and recognizes
+complete standard protein aromatic rings for eligible pi-sulfur contacts.
+Protein, ligand, and residue color changes now affect only carbon atoms;
+other elements retain their standard PyMOL colors.
 
 ## Release 0.7.1
 
@@ -65,7 +73,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release record.
 
 The plugin bundles the reviewed DockLens scientific core and locks it by
 SHA-256 over its LF-normalised content. Its current contract is
-`docklens-scientific-profiles-2026.08`. PyMOL detection, drawing, occupancy,
+`docklens-scientific-profiles-2026.09`. PyMOL detection, drawing, occupancy,
 and CSV export use the native DockLens detector criteria; the `ds_like`
 reporting filter is available on demand through the analysis view below.
 
@@ -224,6 +232,9 @@ metalloproteins. Receptor and ligand selections must remain distinct.
 
 ## Appearance API
 
+Protein, ligand, and interacting-residue colors apply only to carbon atoms.
+Other elements retain PyMOL's standard element colors, including sulfur.
+
 Old calls remain valid:
 
 ```python
@@ -284,10 +295,18 @@ This applies a white-background publication preset and can save a 300 DPI PNG.
 - Explicit-hydrogen structures use the native profile's H...A, D-H...A, and
   acceptor-base geometry. Structures without hydrogen use DockLens' conservative
   inferred-hydrogen fallback where the selected profile permits it.
-- MOL2/SYBYL atom types, bond orders, formal charges, and partial charges are
-  retained when PyMOL exposes them. Lower-information inputs can produce
-  diagnostics in `interactions_parity_status`.
+- MOL2/SYBYL atom types, bond orders between typed atoms, and partial charges
+  are retained when PyMOL exposes them. Formal charges inferred by PyMOL from
+  those types are excluded, matching DockLens' MOL2 parser.
+- Untyped atoms, including the PyMOL PDB placeholder `??`, use DockLens' PDB
+  fallback: connectivity and formal charges are retained, but inferred bond
+  orders/aromaticity are not promoted to typed chemistry. PDB and MOL2 can
+  therefore differ when their chemical information differs; compare the same
+  structures, scientific profile, reporting view, selections, and cutoffs.
+  Lower-information inputs are reported in `interactions_parity_status`.
 - Ring perception is topology/planarity based and requires no RDKit dependency.
+  Complete standard PHE/TYR/TRP/HIS rings provide aromatic evidence when PDB
+  lacks SYBYL types; explicit non-aromatic typing overrides this fallback.
 - Disabling native H-bonds hides matching PyMOL objects; it never deletes them.
 
 ## Files

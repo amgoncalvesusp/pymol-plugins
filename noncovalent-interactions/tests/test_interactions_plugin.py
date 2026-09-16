@@ -389,6 +389,7 @@ def _atom(
 ):
     atom = object.__new__(plugin.Atom)
     atom.idx = idx
+    atom.serial = idx + 1
     atom.elem = elem
     atom.name = name
     atom.resn = resn
@@ -624,7 +625,7 @@ def test_appearance_rejects_invalid_numbers_without_pymol_commands(
 def test_ds_profile_matches_calibrated_geometry():
     plip = plugin.CUTOFF_PROFILES["plip"]
     dsv = _profile_snapshot(plugin.CUTOFF_PROFILES, "dsv")
-    assert plugin.DSV_PARITY_CONTRACT == "docklens-scientific-profiles-2026.08"
+    assert plugin.DSV_PARITY_CONTRACT == "docklens-scientific-profiles-2026.09"
     assert plip == dict(plugin._docklens_core.cutoffs_for_preset("plip"))
     assert dsv == dict(plugin._docklens_core.cutoffs_for_preset("dsv"))
     assert plugin.VALID_TYPES == plugin._docklens_core.VALID_TYPES
@@ -855,6 +856,28 @@ def test_pdb_placeholder_type_preserves_explicit_formal_charge():
     atom = plugin.Atom(0, catom)
 
     assert atom.fcharge == 2
+    assert atom.sybyl_type == ""
+
+
+@pytest.mark.parametrize("atom_type, expected_order", [("??", None), ("C.ar", "ar")])
+def test_bond_orders_require_typed_chemistry(monkeypatch, atom_type, expected_order):
+    """PDB inferred aromaticity must not replace DockLens' untyped fallback."""
+    atoms = [types.SimpleNamespace(
+        symbol="C", name="C%d" % i, resn="LIG", resi="1", chain="",
+        segi="", coord=(i * 1.4, 0, 0), formal_charge=0,
+        text_type=atom_type,
+    ) for i in range(2)]
+    model = types.SimpleNamespace(
+        atom=atoms, bond=[types.SimpleNamespace(index=(0, 1), order=4)]
+    )
+    monkeypatch.setattr(plugin.cmd, "get_model", lambda *a, **kw: model, raising=False)
+
+    loaded, _has_h = plugin._load_atoms("ligand", 1)
+
+    assert loaded[0].neighbors == [loaded[1]]
+    assert loaded[1].neighbors == [loaded[0]]
+    assert loaded[0].bond_orders.get(loaded[1].idx) == expected_order
+    assert loaded[1].bond_orders.get(loaded[0].idx) == expected_order
 
 
 def test_ds_chemistry_excludes_amide_acceptor_and_carbonyl_donor():
@@ -1584,6 +1607,24 @@ def test_appearance_survives_a_missing_residue_selection(monkeypatch):
     assert _setting_was_applied(calls, {"dash_radius"}, 0.09)
 
 
+def test_appearance_colors_only_carbons_and_restores_element_colors(monkeypatch):
+    """Protein, ligand and residue colors must keep O/N/S elemental colors."""
+    calls = _record_pymol_mutations(monkeypatch)
+    plugin.interactions_set_appearance(**_appearance_kwargs(
+        protein_selection="polymer or metals",
+        ligand_selection="organic or resn LIG",
+    ))
+    colors = [args for command, args, _kwargs in calls if command == "color"]
+    for color, selection in (
+        ("gray70", "polymer or metals"),
+        ("orange", "organic or resn LIG"),
+        ("marine", "interactions_residues"),
+    ):
+        assert (color, "(%s) and elem C" % selection) in colors
+        assert ("atomic", "(%s) and not elem C" % selection) in colors
+    assert len(colors) == 6
+
+
 # --------------------------------------------------------------------------
 # 0.7.0 features: DockLens analysis views and the best viewing angle
 # --------------------------------------------------------------------------
@@ -1826,7 +1867,7 @@ def test_occupancy_draws_only_qualifying_final_frame_contacts(monkeypatch, thres
 
 def test_plugin_manager_reports_current_release_version():
     package = importlib.import_module("pymol_interactions_plugin")
-    assert package.__version__ == "0.7.1"
+    assert package.__version__ == "0.7.2"
 
 
 @pytest.mark.parametrize("target_type", ["object:molecule", "object:group"])

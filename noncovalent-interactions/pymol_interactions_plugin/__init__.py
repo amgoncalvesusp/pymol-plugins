@@ -8,7 +8,7 @@ entry point.
 
 from . import interactions_plugin
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 
 def __init_plugin__(app=None):

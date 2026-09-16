@@ -239,9 +239,7 @@ def _conservative_luna_dsv_overrides():
                 dsv["carbon_hbond_acceptor_angle"],
                 luna["carbon_hbond_acceptor_angle"],
             ),
-            "saltbridge_dist": min(
-                dsv["saltbridge_dist"], luna["saltbridge_dist"]
-            ),
+            "saltbridge_dist": min(dsv["saltbridge_dist"], luna["saltbridge_dist"]),
             "attractive_charge_dist": min(
                 dsv["attractive_charge_dist"],
                 luna["attractive_charge_dist"],
@@ -273,13 +271,9 @@ def _conservative_luna_dsv_overrides():
             ),
             "chalcogen_dist": luna["chalcogen_dist"],
             "chalcogen_donor_angle_min": luna["chalcogen_donor_angle_min"],
-            "chalcogen_acceptor_angle_min": luna[
-                "chalcogen_acceptor_angle_min"
-            ],
+            "chalcogen_acceptor_angle_min": luna["chalcogen_acceptor_angle_min"],
             "metal_dist": min(dsv["metal_dist"], luna["metal_dist"]),
-            "pi_sulfur_dist": min(
-                dsv["pi_sulfur_face_dist"], luna["pi_sulfur_dist"]
-            ),
+            "pi_sulfur_dist": min(dsv["pi_sulfur_face_dist"], luna["pi_sulfur_dist"]),
         }
     )
     return values
@@ -502,8 +496,21 @@ class Atom(object):
         return "%s_%s" % (self.res_tag(), self.name)
 
 
+def _atom_sort_key(atom):
+    """Stable source identity, independent of PyMOL's temporary atom indices."""
+    return (
+        atom.chain,
+        atom.resi,
+        atom.resn,
+        atom.name,
+        atom.elem,
+        tuple(atom.coord),
+        atom.serial or 0,
+    )
+
+
 def _find_rings(atoms):
-    """Topology-based aromatic-ring perception. VERBATIM."""
+    """Topology-based ring perception with stable member and ring ordering."""
     adj = {a.idx: [n.idx for n in a.neighbors] for a in atoms}
     by_idx = {a.idx: a for a in atoms}
     rings = set()
@@ -519,7 +526,7 @@ def _find_rings(atoms):
 
     ring_atoms = []
     for ring in rings:
-        members = [by_idx[i] for i in ring]
+        members = sorted((by_idx[i] for i in ring), key=_atom_sort_key)
         if not (5 <= len(members) <= 6):
             continue
         if any(a.elem not in _RING_ELEMENTS for a in members):
@@ -527,7 +534,7 @@ def _find_rings(atoms):
         if _planar_deviation([a.coord for a in members]) > _RING_PLANARITY_TOL:
             continue
         ring_atoms.append(members)
-    return ring_atoms
+    return sorted(ring_atoms, key=lambda members: tuple(map(_atom_sort_key, members)))
 
 
 class Ring(object):
@@ -603,7 +610,7 @@ _VDW_RADII = {
 
 
 def _h_neighbors(atom):
-    return [n for n in atom.neighbors if n.elem == "H"]
+    return sorted((n for n in atom.neighbors if n.elem == "H"), key=_atom_sort_key)
 
 
 _CHEM_NON_ACCEPTOR_SYBYL = {"n.am", "n.4", "n.pl3"}
@@ -634,12 +641,33 @@ def _sybyl(atom):
 
 
 def _heavy_neighbors(atom):
-    return [neighbor for neighbor in atom.neighbors if neighbor.elem != "H"]
+    return sorted((n for n in atom.neighbors if n.elem != "H"), key=_atom_sort_key)
+
+
+# Standard amino-acid ring names from the wwPDB Chemical Component Dictionary.
+# PDB has no SYBYL fields; topology and planarity are checked by _find_rings.
+_PHENYL_NAMES = frozenset({"CG", "CD1", "CD2", "CE1", "CE2", "CZ"})
+_IMIDAZOLE_NAMES = frozenset({"CG", "ND1", "CD2", "CE1", "NE2"})
+_PROTEIN_AROMATIC_RINGS = {
+    "PHE": (_PHENYL_NAMES,),
+    "TYR": (_PHENYL_NAMES,),
+    "TRP": (
+        frozenset({"CG", "CD1", "NE1", "CE2", "CD2"}),
+        frozenset({"CD2", "CE2", "CZ2", "CH2", "CZ3", "CE3"}),
+    ),
+    **{name: (_IMIDAZOLE_NAMES,) for name in ("HIS", "HID", "HIE", "HIP", "HSP")},
+}
 
 
 def _ring_has_aromatic_evidence(ring):
-    """Require MOL2 aromatic typing/bonds for strict pi interactions."""
+    """Accept declared aromatic chemistry or a complete standard protein ring."""
     members = tuple(ring.atoms)
+    if members and len({(a.resn, a.resi, a.chain, a.segi) for a in members}) == 1:
+        names = frozenset(a.name for a in members)
+        if names in _PROTEIN_AROMATIC_RINGS.get(members[0].resn, ()):
+            # Explicit non-aromatic typing overrides the protein-name fallback.
+            if all(not _sybyl(a) or _sybyl(a) in {"c.ar", "n.ar"} for a in members):
+                return True
     member_ids = {atom.idx for atom in members}
     typed_aromatic = all(_sybyl(atom) in {"c.ar", "n.ar"} for atom in members)
     bonded_aromatic = all(
@@ -814,9 +842,9 @@ def classify(atoms, rings, has_h, chemistry_profile="plip"):
 
     # charged centres from formal charge
     for a in atoms:
-        if a.fcharge > 0:
+        if a.fcharge > 0 and a.name not in _CATION_RES_ATOMS.get(a.resn, ()):
             cations.append((a.coord, a.label(), a))
-        elif a.fcharge < 0:
+        elif a.fcharge < 0 and a.name not in _ANION_RES_ATOMS.get(a.resn, ()):
             anions.append((a.coord, a.label(), a))
 
     # protein charged groups (grouped centres)
@@ -883,8 +911,7 @@ def classify(atoms, rings, has_h, chemistry_profile="plip"):
             if _chemistry_aware_donor(
                 a,
                 allow_inferred_hydrogen=(
-                    not requires_explicit_donor
-                    and not side_has_explicit_hydrogens
+                    not requires_explicit_donor and not side_has_explicit_hydrogens
                 ),
             ):
                 hs = _h_neighbors(a)
@@ -1005,9 +1032,7 @@ def _hbond_pairs(feat_a, feat_b, itype, dist_cut, angle_cut, has_h):
                 for hydrogen in hs:
                     hydrogen_distance = _dist(hydrogen.coord, acc.coord)
                     use_h_a = bool(cutoffs.get(f"{prefix}_h_a_required", 0.0))
-                    if use_h_a and hydrogen_distance > cutoffs[
-                        f"{prefix}_h_a_dist"
-                    ]:
+                    if use_h_a and hydrogen_distance > cutoffs[f"{prefix}_h_a_dist"]:
                         continue
                     donor_angle = _angle_at(
                         hydrogen.coord,
@@ -1232,9 +1257,7 @@ def detect_pipi(fa, fb):
                 stacked = theta <= c["pipi_stacked_theta_max"]
                 if "pipi_stacked_gamma_max" in c:
                     stacked = stacked and gamma <= c["pipi_stacked_gamma_max"]
-                tshaped = (
-                    90.0 - theta <= c["pipi_t_theta_deviation_max"]
-                )
+                tshaped = 90.0 - theta <= c["pipi_t_theta_deviation_max"]
                 if "pipi_t_gamma_min" in c:
                     tshaped = tshaped and gamma >= c["pipi_t_gamma_min"]
                 if stacked:
@@ -1302,13 +1325,12 @@ def detect_pication(fa, fb):
                     continue
                 profile = _ACTIVE_CHEMISTRY_PROFILE.get()
                 if profile == "plip":
-                    if _proj_offset(cpt, r.centroid, r.normal) > c[
-                        "pication_offset"
-                    ]:
+                    if _proj_offset(cpt, r.centroid, r.normal) > c["pication_offset"]:
                         continue
-                elif "pication_angle_max" in c and _axis_angle(
-                    cpt, r.centroid, r.normal
-                ) > c["pication_angle_max"]:
+                elif (
+                    "pication_angle_max" in c
+                    and _axis_angle(cpt, r.centroid, r.normal) > c["pication_angle_max"]
+                ):
                     continue
                 out.append(
                     _mk(
@@ -1503,17 +1525,17 @@ def detect_alkyl(fa, fb):
             if distance > cut:
                 continue
             record = _mk(
-                    "alkyl",
-                    "",
-                    a.label(),
-                    b.label(),
-                    a.coord,
-                    b.coord,
-                    a,
-                    b,
-                    "alkyl",
-                    "alkyl",
-                )
+                "alkyl",
+                "",
+                a.label(),
+                b.label(),
+                a.coord,
+                b.coord,
+                a,
+                b,
+                "alkyl",
+                "alkyl",
+            )
             if not semantic_dedup:
                 out.append(record)
                 continue
@@ -1540,9 +1562,10 @@ def detect_halogen(fa, fb):
                 if profile == "plip":
                     if distance > c["halogen_dist"]:
                         continue
-                    if _angle_at(x.coord, cbonded.coord, acc.coord) < c[
-                        "halogen_angle"
-                    ]:
+                    if (
+                        _angle_at(x.coord, cbonded.coord, acc.coord)
+                        < c["halogen_angle"]
+                    ):
                         continue
                 else:
                     distance_limits = []
@@ -1566,8 +1589,7 @@ def detect_halogen(fa, fb):
                     if not bases:
                         continue
                     acceptor_angle = max(
-                        _angle_at(acc.coord, x.coord, base.coord)
-                        for base in bases
+                        _angle_at(acc.coord, x.coord, base.coord) for base in bases
                     )
                     if acceptor_angle < c["halogen_acceptor_angle_min"]:
                         continue
@@ -1634,15 +1656,11 @@ def detect_pi_sulfur(fa, fb):
                         cut,
                         cutoffs.get("pi_sulfur_face_dist", cut),
                     )
-                    face = (
-                        distance <= face_limit
-                        and axis_angle
-                        <= cutoffs.get("pi_sulfur_face_angle_max", 25.0)
+                    face = distance <= face_limit and axis_angle <= cutoffs.get(
+                        "pi_sulfur_face_angle_max", 25.0
                     )
-                    edge = (
-                        distance <= cut
-                        and axis_angle
-                        >= cutoffs.get("pi_sulfur_edge_angle_min", 70.0)
+                    edge = distance <= cut and axis_angle >= cutoffs.get(
+                        "pi_sulfur_edge_angle_min", 70.0
                     )
                     if face:
                         subtype = "face-on"
@@ -1706,10 +1724,9 @@ def detect_chalcogen(fa, fb):
                     )
                 if not limits or distance > min(limits):
                     continue
-                donor_angle = _angle_at(
-                    chalcogen.coord,
-                    bonded.coord,
-                    acceptor.coord,
+                donor_angle = max(
+                    _angle_at(chalcogen.coord, base.coord, acceptor.coord)
+                    for base in (_heavy_neighbors(chalcogen) or [bonded])
                 )
                 if donor_angle < cutoffs["chalcogen_donor_angle_min"]:
                     continue
@@ -1938,11 +1955,11 @@ def compute_interactions(
     cutoff_token = _ACTIVE_CUTOFFS.set(MappingProxyType(effective_cutoffs))
     chemistry_token = _ACTIVE_CHEMISTRY_PROFILE.set(chemistry_profile)
     try:
-        waters = waters or []
+        receptor_atoms = sorted(receptor_atoms, key=_atom_sort_key)
+        ligand_atoms = sorted(ligand_atoms, key=_atom_sort_key)
+        waters = sorted(waters or [], key=_atom_sort_key)
         req = (
-            list(types)
-            if types
-            else list(default_types_for_profile(chemistry_profile))
+            list(types) if types else list(default_types_for_profile(chemistry_profile))
         )
         # ``has_h`` preserves the legacy PLIP behavior and controls explicit
         # carbon-donor geometry. Chemistry-aware donor fallback is deliberately

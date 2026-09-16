@@ -93,7 +93,7 @@ import numpy as np
 from pymol import cmd
 
 _EXPECTED_DOCKLENS_CORE_SHA256 = (
-    "9a19061c2cf1551a1d07836a973a840647be4c7ae58c22167f9ed35f23d6c76b"
+    "18ccb4f88ddd67e17ca6246a2824c5e2d22a384a90f48b12a2194ec9f99784b8"
 )
 _EXPECTED_ANALYSIS_PROFILE_SHA256 = (
     "5132773cd6f6c908b20e1ee50face4e554bbf5d52fa25d9f8a19e2561c256148"
@@ -174,8 +174,8 @@ except (ImportError, ValueError):
     _profiles_spec.loader.exec_module(_docklens_analysis_profiles)
 
 
-DSV_PARITY_CONTRACT = "docklens-scientific-profiles-2026.08"
-PLUGIN_VERSION = "0.7.1"
+DSV_PARITY_CONTRACT = "docklens-scientific-profiles-2026.09"
+PLUGIN_VERSION = "0.7.2"
 
 
 def _module_source_sha256(module):
@@ -500,7 +500,9 @@ class Atom(object):
             fallback_type = getattr(catom, "type", "")
             raw_type = fallback_type if isinstance(fallback_type, str) else ""
         self.sybyl_type = str(raw_type or "").strip()
-        if self.sybyl_type and self.sybyl_type != "??":
+        if self.sybyl_type == "??":
+            self.sybyl_type = ""
+        if self.sybyl_type:
             # DockLens' MOL2/PDBQT parsers treat their charge column as partial
             # charge only. PyMOL may infer formal charges from the same types;
             # ignoring that inference keeps the two pipelines identical.
@@ -550,6 +552,10 @@ def _load_atoms(selection, state, index_offset=0):
         i, j = bond.index
         atoms[i].neighbors.append(atoms[j])
         atoms[j].neighbors.append(atoms[i])
+        # PyMOL infers orders for untyped PDB atoms. DockLens' PDB path
+        # carries connectivity only; retain orders for typed MOL2 chemistry.
+        if not (atoms[i].sybyl_type and atoms[j].sybyl_type):
+            continue
         raw_order = getattr(bond, "order", 1)
         try:
             numeric_order = float(raw_order)
@@ -2593,6 +2599,12 @@ def _apply_optional_style(description, action):
         return False
 
 
+def _color_molecule_carbons(color, selection):
+    """Apply the chosen carbon color and retain standard element colors."""
+    cmd.color(color, "(%s) and elem C" % selection)
+    cmd.color("atomic", "(%s) and not elem C" % selection)
+
+
 def interactions_set_appearance(
     thickness=0.06,
     dash_scale=1.0,
@@ -2696,9 +2708,9 @@ def interactions_set_appearance(
     hydrogen_selection = "(%s) and elem H" % molecule_selection
 
     if protein_color is not None:
-        cmd.color(protein_color, protein_selection)
+        _color_molecule_carbons(protein_color, protein_selection)
     if ligand_color is not None:
-        cmd.color(ligand_color, ligand_selection)
+        _color_molecule_carbons(ligand_color, ligand_selection)
     # <group>_residues exists only after a detection run with
     # show_residues=1. Styling it unconditionally raised and aborted the
     # whole call, which is why the GUI Detect button could die before it
@@ -2706,7 +2718,9 @@ def interactions_set_appearance(
     if interacting_residue_color is not None:
         _apply_optional_style(
             "interacting-residue colour",
-            lambda: cmd.color(interacting_residue_color, residue_selection),
+            lambda: _color_molecule_carbons(
+                interacting_residue_color, residue_selection
+            ),
         )
     if stick_radius is not None:
         cmd.set("stick_radius", stick_radius, molecule_selection)
