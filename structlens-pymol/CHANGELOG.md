@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0
+
+- Visualize protein-protein and peptide-protein contacts exported by StructLens v0.6.0 using the matching coordinate file.
+
 ## 0.3.1 — 2026-09-06
 
 - Load mmCIF with the correct parser and remove temporary coordinate files.

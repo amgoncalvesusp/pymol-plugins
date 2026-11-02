@@ -10,7 +10,7 @@ from structlens_pymol_plugin import __version__
 
 
 def test_plugin_package_reports_current_release_version():
-    assert __version__ == "0.3.1"
+    assert __version__ == "0.4.0"
 
 
 @pytest.mark.parametrize("stage", ["reader", "load", "selection"])
@@ -61,6 +61,5 @@ def test_plugin_registers_menu_through_pymol_api(monkeypatch):
     monkeypatch.setitem(sys.modules, "pymol.plugins", SimpleNamespace(addmenuitemqt=add_menu))
     monkeypatch.setattr(plugin, "_controller", None)
     plugin.__init_plugin__(object())
-    command.extend.assert_called_once()
-    add_menu.assert_called_once()
-    assert add_menu.call_args.args[0] == "StructLens-PyMOL"
+    assert [call.args[0] for call in command.extend.call_args_list] == ["structlens_open", "structlens_interface"]
+    assert [call.args[0] for call in add_menu.call_args_list] == ["StructLens-PyMOL", "StructLens-PyMOL interfaces…"]

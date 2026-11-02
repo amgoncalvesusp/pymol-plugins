@@ -19,6 +19,7 @@ def __init_plugin__(app: Any = None) -> None:
     from pymol.plugins import addmenuitemqt
 
     addmenuitemqt("StructLens-PyMOL", lambda: open_analysis())
+    addmenuitemqt("StructLens-PyMOL interfaces…", lambda: _choose_interface(cmd))
 
 
 def open_analysis(path: str | None = None) -> Any:
@@ -34,3 +35,17 @@ def open_analysis(path: str | None = None) -> Any:
     if not path:
         return None
     return _controller.open_bundle(path)
+
+def _choose_interface(command):
+    from pymol.Qt import QtWidgets
+    from .interface import open_interface
+
+    path, _ = QtWidgets.QFileDialog.getOpenFileName(None, "Open StructLens interface", "", "Interface CSV (*.csv)")
+    if not path:
+        return
+    source, _ = QtWidgets.QFileDialog.getOpenFileName(None, "Select original coordinates", "", "Coordinates (*.pdb *.ent *.cif *.mmcif)")
+    if source:
+        try:
+            open_interface(command, path, source)
+        except Exception as error:
+            QtWidgets.QMessageBox.warning(None, "StructLens interface", str(error))

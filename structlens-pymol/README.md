@@ -28,7 +28,7 @@ Overview, Mutation Focus, Key Residues, Mutated Key Residues, Structural
 Deviation, Outliers, and Publication presets. Target-specific scientific
 values remain the values recorded by StructLens.
 
-Tested contract: bundle schema `1.x`; plugin `0.3.1`. PyMOL versions should be
+Tested contract: bundle schema `1.x`; plugin `0.4.0`. PyMOL versions should be
 verified on the release page. If the plugin is unavailable, export remains a
 portable data bundle that can be inspected and re-imported after installation.
 
@@ -41,3 +41,13 @@ The plugin reads (without recalculating) optional `analysis/msa_summary.json`,
 gained / lost interaction selections, reference and target site selections,
 and displacement arrows from the coordinates recorded by StructLens. Lost
 interactions use reference geometry; gained interactions use target geometry.
+
+## View subunit contacts from StructLens v0.6.0
+
+In StructLens, open **Project → Subunit interfaces…**, calculate the interface, and export the contact CSV. In PyMOL, choose **Plugin → StructLens-PyMOL interfaces…** and select the CSV and the exact PDB or mmCIF coordinate file used for the calculation. The plugin checks the source SHA-256 and highlights contacting residues on both chains. This import supports single-model structures.
+
+Command-line equivalent:
+
+```
+structlens_interface contacts.csv, original.pdb
+```
